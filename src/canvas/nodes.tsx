@@ -148,7 +148,9 @@ export function SolidNode({ data, id, selected }: NodeProps) {
 }
 
 export function PlotterNode({ id, selected, data }: NodeProps) {
-  const n = ((data as Record<string, unknown>).seriesCount as number) ?? 0;
+  const d = data as Record<string, unknown>;
+  const n = (d.seriesCount as number) ?? 0;
+  const title = (d.title as string) || 'Plotter';
   return (
     <div className={`node${selected ? ' sel' : ''}`} style={{ ['--acc' as string]: KIND_ACCENT.plotter }}>
       <div className="node-head">
@@ -156,10 +158,10 @@ export function PlotterNode({ id, selected, data }: NodeProps) {
         <span className="node-id">{id}</span>
       </div>
       <div className="node-body">
-        <div className="node-title">{n === 0 ? 'No series yet' : `${n} series`}</div>
+        <div className="node-title">{title}</div>
         <div className="node-sub">
-          x — time<br />
-          y — drag any hex port here
+          {n === 0 ? 'no series yet' : `${n} series`}<br />
+          x — time
         </div>
       </div>
       <span className="handle-tag" style={{ top: -17, left: 46 }}>x</span>

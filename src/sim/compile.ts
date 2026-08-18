@@ -32,8 +32,7 @@ function solveLqrGains(a: number, b: number, q1: number, q2: number, r: number) 
   return { k1, k2 };
 }
 
-export interface Compiled {
-  battery: BatteryBlock;
+export interface Mechanism {
   motorBlock: MotorBlock;
   motor: MotorConstants;
   gears: GearBlock[];
@@ -66,6 +65,18 @@ export interface Compiled {
   lqrGains: { k1: number; k2: number; a: number; b: number } | null;
 }
 
+/**
+ * A graph can hold several independent mechanisms -- an arm and a drivetrain,
+ * say -- that share nothing mechanically but DO share one electrical bus. The
+ * battery lives here, once; every mechanism's current draw sags the same
+ * V_bus, which is exactly why they cannot be simulated as separate isolated
+ * problems even though their motion is independent.
+ */
+export interface System {
+  battery: BatteryBlock;
+  mechanisms: Mechanism[];
+}
+
 export class CompileError extends Error {
   /** The block responsible, when one can be pinpointed, for canvas highlighting. */
   blockId?: string;
@@ -75,29 +86,14 @@ export class CompileError extends Error {
   }
 }
 
-export function compile(blocks: Block[], edges: Edge[]): Compiled {
-  const byId = new Map(blocks.map((b) => [b.id, b]));
-
-  const battery = blocks.find((b): b is BatteryBlock => b.kind === 'battery');
-  const motorBlock = blocks.find((b): b is MotorBlock => b.kind === 'motor');
-  if (!battery) throw new CompileError('No battery block. Add one to power the motors.');
-  if (!motorBlock) throw new CompileError('No motor block. The chain needs a source of torque.');
-
-  // Walk the mechanical chain from the motor to a terminal solid block.
-  const next = new Map<string, string>();
-  for (const e of edges) {
-    const src = byId.get(e.from.blockId);
-    // Signal and control edges are not part of the mechanical chain.
-    if (src && src.kind !== 'battery'
-        && e.from.portId !== 'signal' && e.from.portId !== 'command') {
-      next.set(e.from.blockId, e.to.blockId);
-    }
-  }
-
+/** Walk downstream from a motor to its terminal solid, collecting gears. */
+function walkChain(
+  motorId: string, byId: Map<string, Block>, next: Map<string, string>,
+): { gears: GearBlock[]; solid: SolidBlock } {
   const gears: GearBlock[] = [];
   let solid: SolidBlock | undefined;
-  let cursor: string | undefined = next.get(motorBlock.id);
-  const seen = new Set<string>([motorBlock.id]);
+  let cursor = next.get(motorId);
+  const seen = new Set<string>([motorId]);
 
   while (cursor) {
     if (seen.has(cursor)) throw new CompileError('The mechanical chain contains a loop.', cursor);
@@ -110,7 +106,16 @@ export function compile(blocks: Block[], edges: Edge[]): Compiled {
     cursor = next.get(cursor);
   }
 
-  if (!solid) throw new CompileError('The chain does not end in a solid block.');
+  if (!solid) throw new CompileError('The chain does not end in a solid block.', motorId);
+  return { gears, solid };
+}
+
+/** Resolve one motor's downstream chain into everything the solver needs. */
+function resolveMechanism(
+  motorBlock: MotorBlock, battery: BatteryBlock,
+  byId: Map<string, Block>, next: Map<string, string>, edges: Edge[],
+): Mechanism {
+  const { gears, solid } = walkChain(motorBlock.id, byId, next);
 
   // Accumulate ratio, efficiency, and drum radius.
   let ratio = 1;
@@ -187,7 +192,7 @@ export function compile(blocks: Block[], edges: Edge[]): Compiled {
   const jEffOutput = inertiaSolid + n * motor.spec.rotorInertia * ratio * ratio;
 
   let errorSource: string | null = null;
-  let lqrGains: Compiled['lqrGains'] = null;
+  let lqrGains: Mechanism['lqrGains'] = null;
 
   if (controller && (controller.kind === 'pid' || controller.kind === 'bangbang')) {
     errorSource = controller.source ?? `${solid.id}.position`;
@@ -199,8 +204,14 @@ export function compile(blocks: Block[], edges: Edge[]): Compiled {
       `${solid.id}.position`, `${solid.id}.velocity`, `${motorBlock.id}.speed`,
     ]);
     if (!readable.has(errorSource)) {
+      // Distinguish "wrong kind of channel" from "right kind, wrong
+      // mechanism" -- the second is much easier to hit once a graph holds
+      // several mechanisms, and the generic message actively misleads.
+      const isStateChannel = /\.(position|velocity|speed)$/.test(errorSource);
       throw new CompileError(
-        `"${errorSource}" cannot be used as a controller error source. Controllers read shaft state, so pick a position or velocity channel.`,
+        isStateChannel
+          ? `Controller "${controller.id}" drives "${motorBlock.id}" but measures "${errorSource}", which belongs to a different mechanism. A controller has to read the shaft it actually drives.`
+          : `"${errorSource}" cannot be used as a controller error source. Controllers read shaft state, so pick a position or velocity channel.`,
         controller.id,
       );
     }
@@ -218,11 +229,6 @@ export function compile(blocks: Block[], edges: Edge[]): Compiled {
       );
     }
     const posScale = solid.gravityMode === 'constant' ? radius! : (180 / Math.PI);
-    // Linearized plant at the output shaft: theta-dot = omega,
-    // omega-dot = -a*omega + b*duty. Derived from the same closed-form
-    // current/torque relationship the solver uses, holding battery sag and
-    // current limiting aside -- both are secondary effects the regulator does
-    // not need to see to compute a stabilizing gain.
     const a = (n * motor.Kt * ratio * ratio * efficiency) / (motor.Kv * motor.R * jEffOutput);
     const b = ((n * motor.Kt * ratio * efficiency * battery.vOc) / (motor.R * jEffOutput)) * posScale;
     const { k1, k2 } = solveLqrGains(a, b, lqr.qPos, lqr.qVel, lqr.r);
@@ -237,11 +243,97 @@ export function compile(blocks: Block[], edges: Edge[]): Compiled {
     : (solid.initialPosition * Math.PI) / 180;
 
   return {
-    battery, motorBlock, motor, gears, solid,
+    motorBlock, motor, gears, solid,
     ratio, efficiency, radius, inertiaSolid, jEffOutput,
     friction: solid.friction, theta0, linearDisplay, gravityTorque,
     controller, errorSource, lqrGains,
   };
+}
+
+/**
+ * Compile the whole graph: one battery, any number of independent mechanisms.
+ * Each motor block found is the head of its own chain -- two motor blocks are
+ * two mechanisms, not one merged one. Two motor BLOCKS driving the same solid
+ * (a differential, a dual-motor merge) is a real feature this does not support
+ * yet, and is rejected with a specific error rather than silently picking one.
+ */
+export function compile(blocks: Block[], edges: Edge[]): System {
+  const byId = new Map(blocks.map((b) => [b.id, b]));
+
+  const battery = blocks.find((b): b is BatteryBlock => b.kind === 'battery');
+  const motorBlocks = blocks.filter((b): b is MotorBlock => b.kind === 'motor');
+  if (!battery) throw new CompileError('No battery block. Add one to power the motors.');
+  if (motorBlocks.length === 0) {
+    throw new CompileError('No motor block. Every mechanism needs a source of torque.');
+  }
+
+  // Every motor must be wired to THIS battery specifically -- v1 supports one
+  // shared bus, not several batteries feeding different mechanisms.
+  const poweredIds = new Set(
+    edges
+      .filter((e) => e.from.blockId === battery.id && e.from.portId === 'out' && e.to.portId === 'power')
+      .map((e) => e.to.blockId),
+  );
+  for (const m of motorBlocks) {
+    if (!poweredIds.has(m.id)) {
+      throw new CompileError(`Motor "${m.id}" isn't connected to the battery.`, m.id);
+    }
+  }
+
+  // Walk the mechanical chain from each motor. Signal and control edges are
+  // not part of the mechanical chain.
+  const next = new Map<string, string>();
+  for (const e of edges) {
+    const src = byId.get(e.from.blockId);
+    if (src && src.kind !== 'battery'
+        && e.from.portId !== 'signal' && e.from.portId !== 'command') {
+      next.set(e.from.blockId, e.to.blockId);
+    }
+  }
+
+  // A controller's command output has no fan-out limit at the canvas level
+  // (only the motor's command INPUT is one-to-one), so one controller can be
+  // wired to several motors. That silently makes two mechanisms share one
+  // block's target and gains -- they look interconnected, because they are.
+  // Catch it here, before per-mechanism resolution produces a confusing error
+  // about the wrong block.
+  const drivenBy = new Map<string, string[]>();
+  for (const e of edges) {
+    if (e.to.portId !== 'command') continue;
+    const src = byId.get(e.from.blockId);
+    if (!src || !CONTROL_KINDS.has(src.kind)) continue;
+    const list = drivenBy.get(src.id) ?? [];
+    list.push(e.to.blockId);
+    drivenBy.set(src.id, list);
+  }
+  for (const [ctrlId, motors] of drivenBy) {
+    if (motors.length > 1) {
+      throw new CompileError(
+        `Controller "${ctrlId}" is wired to ${motors.length} motors (${motors.join(', ')}). Each mechanism needs its own controller — otherwise they share one target and one set of gains.`,
+        ctrlId,
+      );
+    }
+  }
+
+  const claimed = new Map<string, string>(); // blockId -> which motor already uses it
+  const mechanisms: Mechanism[] = [];
+
+  for (const motorBlock of motorBlocks) {
+    const mech = resolveMechanism(motorBlock, battery, byId, next, edges);
+    for (const b of [...mech.gears, mech.solid]) {
+      const owner = claimed.get(b.id);
+      if (owner) {
+        throw new CompileError(
+          `"${b.id}" is driven by both "${owner}" and "${motorBlock.id}". Two motors sharing one mechanism (a differential, a dual-motor merge) isn't supported yet -- give each its own chain.`,
+          b.id,
+        );
+      }
+      claimed.set(b.id, motorBlock.id);
+    }
+    mechanisms.push(mech);
+  }
+
+  return { battery, mechanisms };
 }
 
 /** Convenience constructors so common inertias do not have to be looked up. */

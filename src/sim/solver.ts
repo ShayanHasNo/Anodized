@@ -1,49 +1,59 @@
 /**
  * Discrete forward simulation.
  *
- * Each timestep runs four phases in a fixed order:
- *   1. read state      -- shaft angle and speed
- *   2. evaluate signals -- no-op in v1; the controller block plugs in here in v2
- *   3. compute torque   -- closed-form electrical model, then the torque balance
- *   4. integrate        -- semi-implicit Euler
+ * A system can hold several independent mechanisms sharing one battery. Their
+ * MOTION is independent -- an arm and a drivetrain do not push on each other
+ * -- but their CURRENT is not: both draw from the same V_bus, and one sagging
+ * it affects the other's torque. So every timestep runs two passes across all
+ * mechanisms rather than one straight line down a single chain:
  *
- * Phase 2 exists now precisely so that adding a controller later does not mean
- * restructuring the loop.
+ *   pass 1  each mechanism reads its own state and evaluates its controller,
+ *           producing a duty cycle -- independent of every other mechanism
+ *   solve   the shared bus voltage, closed-form across all branches at once
+ *   pass 2  each mechanism computes its own current/torque against that
+ *           shared V_bus, then integrates forward
+ *
+ * With one mechanism this collapses to exactly the single-branch formula the
+ * tool always used; the N-branch case is a strict generalization of it, not a
+ * different algorithm.
  */
 
-import { Compiled, G_ACCEL } from './compile';
+import { System, Mechanism, G_ACCEL } from './compile';
 import { Channel, channelsFor } from './blocks';
 
 const RAD_TO_DEG = 180 / Math.PI;
 
 export interface SimOptions {
-  duration: number;      // seconds
-  dt?: number;           // override the auto-selected timestep
-  /** Stop early once the output reaches this position (rad or m, display units). */
-  stopAtPosition?: number;
+  duration: number; // seconds
+  dt?: number;       // override the auto-selected timestep
 }
 
-export interface SignalPhase {
-  (t: number, state: { theta: number; omega: number; busVoltage: number }): { duty: number };
+export interface MechanismResult {
+  motorId: string;
+  solidId: string;
+  controllerId: string | null;
+  timeConstant: number;
+  linearDisplay: boolean;
+  peakCurrent: number;
+  /** Time to reach the controller's target, or null if never / no controller. */
+  timeToTarget: number | null;
+  /** Error remaining at the end of the run, in the source channel's units. */
+  steadyStateError: number | null;
+  /** How far past the setpoint the mechanism travelled, same units. */
+  overshoot: number | null;
 }
 
 export interface SimResult {
   dt: number;
-  timeConstant: number;
   steps: number;
   channels: Channel[];
   /** Columnar data, keyed by channel key. Every channel is recorded, always. */
   data: Record<string, Float64Array>;
   time: Float64Array;
-  linearDisplay: boolean;
-  /** Time to reach stopAtPosition, or null if never reached. */
-  timeToTarget: number | null;
   minBusVoltage: number;
+  /** Peak of the SUM of every mechanism's current -- what actually stresses the battery. */
   peakCurrent: number;
-  /** Error remaining at the end of the run, in the source channel's units. */
-  steadyStateError: number | null;
-  /** How far past the setpoint the mechanism travelled, same units. */
-  overshoot: number | null;
+  mechanisms: MechanismResult[];
 }
 
 /**
@@ -51,274 +61,300 @@ export interface SimResult {
  * low-inertia mechanism can push this under 5 ms, which is why dt is derived
  * from it rather than fixed.
  */
-export function timeConstant(c: Compiled): number {
-  const n = c.motorBlock.count;
-  const jReflected = c.inertiaSolid / (c.ratio * c.ratio) + n * c.motor.spec.rotorInertia;
-  return (jReflected * c.motor.R) / (n * c.motor.Kt * c.motor.Ke);
+export function timeConstant(m: Mechanism): number {
+  const n = m.motorBlock.count;
+  const jReflected = m.inertiaSolid / (m.ratio * m.ratio) + n * m.motor.spec.rotorInertia;
+  return (jReflected * m.motor.R) / (n * m.motor.Kt * m.motor.Ke);
 }
 
-export function simulate(
-  c: Compiled,
-  opts: SimOptions,
-  signalPhase?: SignalPhase,
-): SimResult {
-  const n = c.motorBlock.count;
-  const { R, Kt, Kv } = c.motor;
-  const G = c.ratio;
-  const eta = c.efficiency;
-  const vOc = c.battery.vOc;
-  const rBatt = c.battery.rBatt + c.battery.rBranch;
+/** Everything about one mechanism that stays constant across the whole run. */
+interface Branch {
+  mech: Mechanism;
+  n: number;
+  R: number;   // motor winding resistance + this branch's own wire/breaker
+  Kt: number;
+  Kv: number;
+  G: number;
+  eta: number;
+  jEff: number;
+  posScale: number;
+  gearCum: { ratio: number; eff: number }[];
+  measure: (theta: number, omega: number) => number;
+  // mutable per-step state
+  theta: number;
+  omega: number;
+  integral: number;
+  prevMeas: number;
+  measMin: number;
+  measMax: number;
+  lastErr: number;
+  startMeas: number;
+  peakCurrent: number;
+  timeToTarget: number | null;
+}
 
-  const tauM = timeConstant(c);
-  const dt = opts.dt ?? Math.min(1e-3, tauM / 20);
+export function simulate(sys: System, opts: SimOptions): SimResult {
+  const vOc = sys.battery.vOc;
+  const rBatt = sys.battery.rBatt; // shared, in series with the TOTAL current
+  const rBranch = sys.battery.rBranch; // each branch's own wire/breaker
+
+  const branches: Branch[] = sys.mechanisms.map((mech) => {
+    const n = mech.motorBlock.count;
+    const { R: Rm, Kt, Kv } = mech.motor;
+    const posScale = mech.linearDisplay ? mech.radius! : RAD_TO_DEG;
+
+    const gearCum: { ratio: number; eff: number }[] = [];
+    {
+      let r = 1, e = 1;
+      for (const g of mech.gears) {
+        e *= g.efficiency;
+        if (g.flavor !== 'drum') r *= g.ratio;
+        gearCum.push({ ratio: r, eff: e });
+      }
+    }
+
+    const measure = (theta: number, omega: number): number => {
+      if (!mech.errorSource) return 0;
+      if (mech.errorSource === `${mech.motorBlock.id}.speed`) return omega * mech.ratio;
+      if (mech.errorSource.endsWith('.velocity')) return omega * posScale;
+      return theta * posScale;
+    };
+
+    return {
+      mech, n, R: Rm + rBranch, Kt, Kv, G: mech.ratio, eta: mech.efficiency,
+      jEff: mech.jEffOutput, posScale, gearCum, measure,
+      theta: mech.theta0, omega: 0, integral: 0, prevMeas: NaN,
+      measMin: Infinity, measMax: -Infinity, lastErr: 0,
+      startMeas: mech.theta0 * posScale, peakCurrent: 0, timeToTarget: null,
+    };
+  });
+
+  // dt is chosen against the STIFFEST mechanism -- the one with the shortest
+  // time constant -- since every branch integrates in lockstep.
+  const tConstants = sys.mechanisms.map(timeConstant);
+  const dt = opts.dt ?? Math.min(1e-3, Math.min(...tConstants) / 20);
   const maxSteps = Math.ceil(opts.duration / dt) + 1;
 
-  // Effective inertia at the output shaft, precomputed in the compile step so
-  // an LQR controller can size its gains against the same number the physics
-  // uses. Includes rotor inertia reflected UP through the ratio -- the term a
-  // naive left-to-right evaluator drops, which makes high-ratio mechanisms
-  // look far too quick.
-  const jEff = c.jEffOutput;
-
-  // Per-gear cumulative ratios, so each gear can report its own torque and speed.
-  const gearCum: { ratio: number; eff: number }[] = [];
-  {
-    let r = 1, e = 1;
-    for (const g of c.gears) {
-      e *= g.efficiency;
-      if (g.flavor !== 'drum') r *= g.ratio;
-      gearCum.push({ ratio: r, eff: e });
-    }
-  }
-
   const channels: Channel[] = [
-    ...channelsFor(c.battery),
-    ...channelsFor(c.motorBlock),
-    ...c.gears.flatMap((g) => channelsFor(g)),
-    ...channelsFor(c.solid),
-    ...(c.controller ? channelsFor(c.controller) : []),
+    ...channelsFor(sys.battery),
+    ...sys.mechanisms.flatMap((m) => [
+      ...channelsFor(m.motorBlock),
+      ...m.gears.flatMap((g) => channelsFor(g)),
+      ...channelsFor(m.solid),
+      ...(m.controller ? channelsFor(m.controller) : []),
+    ]),
   ];
   const data: Record<string, Float64Array> = {};
   for (const ch of channels) data[ch.key] = new Float64Array(maxSteps);
   const time = new Float64Array(maxSteps);
 
-  // --- controller setup ----------------------------------------------------
-  const ctrl = c.controller;
-  const posScale = c.linearDisplay ? c.radius! : RAD_TO_DEG;
-
-  /** Reads the error source from shaft state, in the source channel's units. */
-  const measure = (theta: number, omega: number): number => {
-    if (!c.errorSource) return 0;
-    if (c.errorSource === `${c.motorBlock.id}.speed`) return omega * G;
-    if (c.errorSource.endsWith('.velocity')) return omega * posScale;
-    return theta * posScale;
-  };
-
-  let integral = 0;
-  let prevMeas = NaN;
-  let measMin = Infinity, measMax = -Infinity;
-  let lastErr = 0;
-  const pidLike = ctrl && (ctrl.kind === 'pid' || ctrl.kind === 'bangbang');
-  const startMeas = ctrl ? c.theta0 * posScale : 0;
-
-  let theta = c.theta0;
-  let omega = 0;
-  let alpha = 0;
-  let busVoltage = vOc;
   let minBusVoltage = vOc;
-  let peakCurrent = 0;
-  let timeToTarget: number | null = null;
-
-  const targetTheta = opts.stopAtPosition === undefined
-    ? null
-    : (c.linearDisplay ? opts.stopAtPosition / c.radius! : opts.stopAtPosition / RAD_TO_DEG);
+  let peakTotalCurrent = 0;
 
   let i = 0;
   for (; i < maxSteps; i++) {
     const t = i * dt;
 
-    // --- phase 2: signals and control ---------------------------------------
-    let duty: number;
-    let pidErr = 0, pidP = 0, pidI = 0, pidD = 0, pidOut = 0;
-    let bbErr = 0, bbOut = 0;
-    let lqrPosErr = 0, lqrVelErr = 0, lqrOut = 0, lqrFF = 0;
+    // ---- pass 1: each branch's controller, independent of the others -------
+    const branchOut = branches.map((br) => {
+      const { mech } = br;
+      const ctrl = mech.controller;
+      let duty: number;
+      let pidErr = 0, pidP = 0, pidI = 0, pidD = 0, pidOut = 0;
+      let bbErr = 0, bbOut = 0;
+      let lqrPosErr = 0, lqrVelErr = 0, lqrOut = 0, lqrFF = 0;
 
-    if (ctrl && ctrl.kind === 'pid') {
-      const pid = ctrl;
-      const meas = measure(theta, omega);
-      pidErr = pid.target - meas;
+      if (ctrl && ctrl.kind === 'pid') {
+        const pid = ctrl;
+        const meas = br.measure(br.theta, br.omega);
+        pidErr = pid.target - meas;
 
-      // Derivative on MEASUREMENT, not on error. Differentiating the error term
-      // makes the output spike the instant a setpoint changes, which is a real
-      // problem on hardware and a confusing one to debug in a sim.
-      const dMeas = Number.isNaN(prevMeas) ? 0 : (meas - prevMeas) / dt;
-      prevMeas = meas;
+        // Derivative on MEASUREMENT, not on error -- differentiating error
+        // spikes the output the instant a setpoint changes.
+        const dMeas = Number.isNaN(br.prevMeas) ? 0 : (meas - br.prevMeas) / dt;
+        br.prevMeas = meas;
 
-      pidP = pid.kP * pidErr;
-      pidD = -pid.kD * dMeas;
+        pidP = pid.kP * pidErr;
+        pidD = -pid.kD * dMeas;
 
-      // Conditional integration: stop accumulating while the output is pinned
-      // and the error would push it further into the rail. Without this an arm
-      // that saturates on the way up carries a huge integral past the setpoint
-      // and overshoots badly -- the classic windup failure.
-      const trial = pidP + pid.kI * (integral + pidErr * dt) + pidD + pid.kF;
-      if (Math.abs(trial) < 1 || Math.sign(trial) !== Math.sign(pidErr)) {
-        integral += pidErr * dt;
-      }
-      pidI = pid.kI * integral;
+        // Conditional integration: stop accumulating while output is pinned
+        // and error would push it further into the rail -- the standard
+        // anti-windup fix for a saturating actuator.
+        const trial = pidP + pid.kI * (br.integral + pidErr * dt) + pidD + pid.kF;
+        if (Math.abs(trial) < 1 || Math.sign(trial) !== Math.sign(pidErr)) {
+          br.integral += pidErr * dt;
+        }
+        pidI = pid.kI * br.integral;
 
-      pidOut = pidP + pidI + pidD + pid.kF;
-      duty = pidOut;
-    } else if (ctrl && ctrl.kind === 'bangbang') {
-      const bb = ctrl;
-      const meas = measure(theta, omega);
-      bbErr = bb.target - meas;
-      bbOut = bbErr > bb.deadband ? bb.output : bbErr < -bb.deadband ? -bb.output : 0;
-      duty = bbOut;
-    } else if (ctrl && ctrl.kind === 'lqr' && c.lqrGains) {
-      const lqr = ctrl;
-      const posMeas = theta * posScale;
-      const velMeas = omega * posScale;
-      lqrPosErr = lqr.targetPos - posMeas;
-      lqrVelErr = lqr.targetVel - velMeas;
+        pidOut = pidP + pidI + pidD + pid.kF;
+        duty = pidOut;
+      } else if (ctrl && ctrl.kind === 'bangbang') {
+        const bb = ctrl;
+        const meas = br.measure(br.theta, br.omega);
+        bbErr = bb.target - meas;
+        bbOut = bbErr > bb.deadband ? bb.output : bbErr < -bb.deadband ? -bb.output : 0;
+        duty = bbOut;
+      } else if (ctrl && ctrl.kind === 'lqr' && mech.lqrGains) {
+        const lqr = ctrl;
+        const posMeas = br.theta * br.posScale;
+        const velMeas = br.omega * br.posScale;
+        lqrPosErr = lqr.targetPos - posMeas;
+        lqrVelErr = lqr.targetVel - velMeas;
 
-      if (lqr.gravityFeedforward) {
-        // Duty needed to hold the shaft still against gravity at this angle:
-        // solve tau_gravity = n*Kt*I*G*eta for I, then I = V/R at zero speed.
-        const tauGrav = c.gravityTorque(theta);
-        const holdCurrent = tauGrav / (n * Kt * G * eta);
-        lqrFF = (holdCurrent * R) / vOc;
-      }
+        if (lqr.gravityFeedforward) {
+          const tauGrav = mech.gravityTorque(br.theta);
+          const holdCurrent = tauGrav / (br.n * br.Kt * br.G * br.eta);
+          lqrFF = (holdCurrent * br.R) / vOc;
+        }
 
-      lqrOut = c.lqrGains.k1 * lqrPosErr + c.lqrGains.k2 * lqrVelErr + lqrFF;
-      duty = lqrOut;
-    } else if (signalPhase) {
-      duty = signalPhase(t, { theta, omega, busVoltage }).duty;
-    } else {
-      duty = c.motorBlock.duty;
-    }
-
-    const D = Math.max(-1, Math.min(1, duty));
-
-    // --- phase 3: torque ----------------------------------------------------
-    const omegaMotor = omega * G;
-
-    // Closed-form solution of the sag/current circular dependency. Current
-    // depends on bus voltage and bus voltage sags with current, but the
-    // relationship is linear, so no iteration is needed.
-    const denom = R + n * Math.abs(D) * rBatt;
-    let iTotal = (n * (D * vOc - omegaMotor / Kv)) / denom;
-
-    const limit = n * c.motorBlock.currentLimit;
-    if (iTotal > limit) iTotal = limit;
-    else if (iTotal < -limit) iTotal = -limit;
-
-    const tauMotor = Kt * iTotal;
-    busVoltage = vOc - iTotal * rBatt;
-    const appliedVoltage = D * busVoltage;
-
-    const tauGrav = c.gravityTorque(theta);
-
-    // Efficiency always opposes motion. When the motor drives, it eats motor
-    // torque; when the load overhauls (an arm falling), it resists the fall
-    // instead, so it is applied to the gravity term.
-    const driving = tauMotor * omega >= 0;
-    const tauDrive = driving ? tauMotor * G * eta : tauMotor * G;
-    const tauGravEff = driving ? tauGrav : tauGrav * eta;
-
-    let tauNet = tauDrive - tauGravEff;
-
-    // Coulomb friction with a stiction band, so the mechanism can actually hold
-    // still instead of chattering across zero.
-    if (Math.abs(omega) > 1e-4) {
-      tauNet -= c.friction * Math.sign(omega);
-    } else if (Math.abs(tauNet) <= c.friction) {
-      tauNet = 0;
-    } else {
-      tauNet -= c.friction * Math.sign(tauNet);
-    }
-
-    alpha = tauNet / jEff;
-
-    // --- record -------------------------------------------------------------
-    time[i] = t;
-    data[`${c.battery.id}.busVoltage`][i] = busVoltage;
-    data[`${c.battery.id}.totalCurrent`][i] = iTotal;
-    data[`${c.motorBlock.id}.current`][i] = iTotal;
-    data[`${c.motorBlock.id}.currentPerMotor`][i] = iTotal / n;
-    data[`${c.motorBlock.id}.appliedVoltage`][i] = appliedVoltage;
-    data[`${c.motorBlock.id}.torque`][i] = tauMotor;
-    data[`${c.motorBlock.id}.speed`][i] = omegaMotor;
-
-    for (let k = 0; k < c.gears.length; k++) {
-      const g = c.gears[k];
-      const prev = k === 0 ? { ratio: 1, eff: 1 } : gearCum[k - 1];
-      const cum = gearCum[k];
-      data[`${g.id}.torqueIn`][i] = tauMotor * prev.ratio * prev.eff;
-      data[`${g.id}.torqueOut`][i] = tauMotor * cum.ratio * cum.eff;
-      data[`${g.id}.speedOut`][i] = omegaMotor / cum.ratio;
-    }
-
-    const scale = c.linearDisplay ? c.radius! : RAD_TO_DEG;
-    data[`${c.solid.id}.position`][i] = theta * scale;
-    data[`${c.solid.id}.velocity`][i] = omega * scale;
-    data[`${c.solid.id}.acceleration`][i] = alpha * scale;
-    data[`${c.solid.id}.gravityTorque`][i] = tauGrav;
-
-    if (pidLike) {
-      const target = ctrl!.kind === 'pid' ? ctrl!.target : (ctrl as { target: number }).target;
-      const err = ctrl!.kind === 'pid' ? pidErr : bbErr;
-      const m = target - err;
-      if (m < measMin) measMin = m;
-      if (m > measMax) measMax = m;
-      lastErr = err;
-
-      // With a controller, "reached" means inside a tolerance band rather than
-      // crossing a line -- a loop that overshoots and comes back has still
-      // arrived, and one that creeps up short never does.
-      const band = Math.max(Math.abs(target) * 0.02, 0.5);
-      if (timeToTarget === null && Math.abs(err) <= band) timeToTarget = t;
-
-      if (ctrl!.kind === 'pid') {
-        data[`${ctrl!.id}.setpoint`][i] = ctrl!.target;
-        data[`${ctrl!.id}.error`][i] = pidErr;
-        data[`${ctrl!.id}.output`][i] = pidOut;
-        data[`${ctrl!.id}.pTerm`][i] = pidP;
-        data[`${ctrl!.id}.iTerm`][i] = pidI;
-        data[`${ctrl!.id}.dTerm`][i] = pidD;
+        lqrOut = mech.lqrGains.k1 * lqrPosErr + mech.lqrGains.k2 * lqrVelErr + lqrFF;
+        duty = lqrOut;
       } else {
-        data[`${ctrl!.id}.setpoint`][i] = ctrl!.target;
-        data[`${ctrl!.id}.error`][i] = bbErr;
-        data[`${ctrl!.id}.output`][i] = bbOut;
-      }
-    } else if (ctrl && ctrl.kind === 'lqr' && c.lqrGains) {
-      const m = theta * posScale;
-      if (m < measMin) measMin = m;
-      if (m > measMax) measMax = m;
-      lastErr = lqrPosErr;
-
-      const band = Math.max(Math.abs(ctrl.targetPos) * 0.02, 0.5);
-      if (timeToTarget === null && Math.abs(lqrPosErr) <= band && Math.abs(lqrVelErr) <= band) {
-        timeToTarget = t;
+        duty = mech.motorBlock.duty;
       }
 
-      data[`${ctrl.id}.posError`][i] = lqrPosErr;
-      data[`${ctrl.id}.velError`][i] = lqrVelErr;
-      data[`${ctrl.id}.output`][i] = lqrOut;
-      data[`${ctrl.id}.feedforward`][i] = lqrFF;
-      data[`${ctrl.id}.k1`][i] = c.lqrGains.k1;
-      data[`${ctrl.id}.k2`][i] = c.lqrGains.k2;
+      const D = Math.max(-1, Math.min(1, duty));
+      const omegaMotor = br.omega * br.G;
+      // The motor sees D*V_bus across its windings, so its own current is
+      //   I_motor = n*(D*V_bus - omega/Kv)/R
+      // but the BATTERY only supplies D times that, by power conservation
+      // through the H-bridge: V_bus*I_batt = (D*V_bus)*I_motor.
+      //
+      // Writing the battery-side draw as I_batt = A*V_bus - B therefore puts
+      // D SQUARED in the A term, which is always non-negative. That matters:
+      // using D directly lets A go negative on reverse duty, which can drive
+      // the shared-bus denominator (1 + rBatt*sum A) through zero and invert
+      // the whole solve.
+      const A = (br.n * D * D) / br.R;
+      const B = (br.n * D * omegaMotor) / (br.Kv * br.R);
+      return { D, omegaMotor, A, B, pidErr, pidP, pidI, pidD, pidOut, bbErr, bbOut, lqrPosErr, lqrVelErr, lqrOut, lqrFF };
+    });
+
+    // ---- solve the shared bus: V_bus(1 + Rbatt*sum A) = Voc + Rbatt*sum B ---
+    // sum A >= 0 always, so the denominator is >= 1 and this can never invert.
+    let sumA = 0, sumB = 0;
+    for (const o of branchOut) { sumA += o.A; sumB += o.B; }
+    const busVoltage = (vOc + rBatt * sumB) / (1 + rBatt * sumA);
+
+    // ---- pass 2: per-branch current, torque, and integration ---------------
+    let totalCurrent = 0;
+    for (let bi = 0; bi < branches.length; bi++) {
+      const br = branches[bi];
+      const { mech } = br;
+      const o = branchOut[bi];
+
+      // Motor current from the resolved bus. This is what a stator current
+      // sensor reads, and what the current limit applies to.
+      let iTotal = (br.n * (o.D * busVoltage - o.omegaMotor / br.Kv)) / br.R;
+      const limit = br.n * mech.motorBlock.currentLimit;
+      if (iTotal > limit) iTotal = limit;
+      else if (iTotal < -limit) iTotal = -limit;
+      // Battery-side draw is D times the motor current -- a motor at 20% duty
+      // pulling 100 A from its controller only pulls about 20 A from the
+      // battery, which is why a robot can run several mechanisms at once.
+      totalCurrent += o.D * iTotal;
+
+      const tauMotor = br.Kt * iTotal;
+      const appliedVoltage = o.D * busVoltage;
+      const tauGrav = mech.gravityTorque(br.theta);
+
+      // Efficiency always opposes motion: eats motor torque while driving,
+      // resists the gravity term while the load is overhauling the motor.
+      const driving = tauMotor * br.omega >= 0;
+      const tauDrive = driving ? tauMotor * br.G * br.eta : tauMotor * br.G;
+      const tauGravEff = driving ? tauGrav : tauGrav * br.eta;
+
+      let tauNet = tauDrive - tauGravEff;
+
+      // Coulomb friction with a stiction band, so the mechanism can hold
+      // still instead of chattering across zero.
+      if (Math.abs(br.omega) > 1e-4) {
+        tauNet -= mech.friction * Math.sign(br.omega);
+      } else if (Math.abs(tauNet) <= mech.friction) {
+        tauNet = 0;
+      } else {
+        tauNet -= mech.friction * Math.sign(tauNet);
+      }
+
+      const alpha = tauNet / br.jEff;
+
+      // ---- record ------------------------------------------------------------
+      data[`${mech.motorBlock.id}.current`][i] = iTotal;
+      data[`${mech.motorBlock.id}.currentPerMotor`][i] = iTotal / br.n;
+      data[`${mech.motorBlock.id}.appliedVoltage`][i] = appliedVoltage;
+      data[`${mech.motorBlock.id}.torque`][i] = tauMotor;
+      data[`${mech.motorBlock.id}.speed`][i] = o.omegaMotor;
+
+      for (let k = 0; k < mech.gears.length; k++) {
+        const g = mech.gears[k];
+        const prev = k === 0 ? { ratio: 1, eff: 1 } : br.gearCum[k - 1];
+        const cum = br.gearCum[k];
+        data[`${g.id}.torqueIn`][i] = tauMotor * prev.ratio * prev.eff;
+        data[`${g.id}.torqueOut`][i] = tauMotor * cum.ratio * cum.eff;
+        data[`${g.id}.speedOut`][i] = o.omegaMotor / cum.ratio;
+      }
+
+      data[`${mech.solid.id}.position`][i] = br.theta * br.posScale;
+      data[`${mech.solid.id}.velocity`][i] = br.omega * br.posScale;
+      data[`${mech.solid.id}.acceleration`][i] = alpha * br.posScale;
+      data[`${mech.solid.id}.gravityTorque`][i] = tauGrav;
+
+      const ctrl = mech.controller;
+      const pidLike = ctrl && (ctrl.kind === 'pid' || ctrl.kind === 'bangbang');
+      if (pidLike) {
+        const target = ctrl!.kind === 'pid' ? ctrl!.target : (ctrl as { target: number }).target;
+        const err = ctrl!.kind === 'pid' ? o.pidErr : o.bbErr;
+        const m = target - err;
+        if (m < br.measMin) br.measMin = m;
+        if (m > br.measMax) br.measMax = m;
+        br.lastErr = err;
+
+        const band = Math.max(Math.abs(target) * 0.02, 0.5);
+        if (br.timeToTarget === null && Math.abs(err) <= band) br.timeToTarget = t;
+
+        if (ctrl!.kind === 'pid') {
+          data[`${ctrl!.id}.setpoint`][i] = ctrl!.target;
+          data[`${ctrl!.id}.error`][i] = o.pidErr;
+          data[`${ctrl!.id}.output`][i] = o.pidOut;
+          data[`${ctrl!.id}.pTerm`][i] = o.pidP;
+          data[`${ctrl!.id}.iTerm`][i] = o.pidI;
+          data[`${ctrl!.id}.dTerm`][i] = o.pidD;
+        } else {
+          data[`${ctrl!.id}.setpoint`][i] = ctrl!.target;
+          data[`${ctrl!.id}.error`][i] = o.bbErr;
+          data[`${ctrl!.id}.output`][i] = o.bbOut;
+        }
+      } else if (ctrl && ctrl.kind === 'lqr' && mech.lqrGains) {
+        const m = br.theta * br.posScale;
+        if (m < br.measMin) br.measMin = m;
+        if (m > br.measMax) br.measMax = m;
+        br.lastErr = o.lqrPosErr;
+
+        const band = Math.max(Math.abs(ctrl.targetPos) * 0.02, 0.5);
+        if (br.timeToTarget === null && Math.abs(o.lqrPosErr) <= band && Math.abs(o.lqrVelErr) <= band) {
+          br.timeToTarget = t;
+        }
+
+        data[`${ctrl.id}.posError`][i] = o.lqrPosErr;
+        data[`${ctrl.id}.velError`][i] = o.lqrVelErr;
+        data[`${ctrl.id}.output`][i] = o.lqrOut;
+        data[`${ctrl.id}.feedforward`][i] = o.lqrFF;
+        data[`${ctrl.id}.k1`][i] = mech.lqrGains.k1;
+        data[`${ctrl.id}.k2`][i] = mech.lqrGains.k2;
+      }
+
+      if (Math.abs(iTotal) > Math.abs(br.peakCurrent)) br.peakCurrent = iTotal;
+
+      // ---- integrate (semi-implicit: omega first, then theta) ----------------
+      br.omega += alpha * dt;
+      br.theta += br.omega * dt;
     }
 
+    time[i] = t;
+    data[`${sys.battery.id}.busVoltage`][i] = busVoltage;
+    data[`${sys.battery.id}.totalCurrent`][i] = totalCurrent;
     if (busVoltage < minBusVoltage) minBusVoltage = busVoltage;
-    if (Math.abs(iTotal) > Math.abs(peakCurrent)) peakCurrent = iTotal;
-    if (!ctrl && timeToTarget === null && targetTheta !== null && theta >= targetTheta) {
-      timeToTarget = t;
-    }
-
-    // --- phase 4: integrate (semi-implicit: omega first, then theta) --------
-    omega += alpha * dt;
-    theta += omega * dt;
+    if (Math.abs(totalCurrent) > Math.abs(peakTotalCurrent)) peakTotalCurrent = totalCurrent;
   }
 
   const steps = i;
@@ -326,21 +362,29 @@ export function simulate(
   const trimmed: Record<string, Float64Array> = {};
   for (const ch of channels) trimmed[ch.key] = trim(data[ch.key]);
 
-  const targetForOvershoot = ctrl
-    ? (ctrl.kind === 'lqr' ? ctrl.targetPos : ctrl.target)
-    : 0;
+  const mechanisms: MechanismResult[] = branches.map((br, bi) => {
+    const { mech } = br;
+    const ctrl = mech.controller;
+    const targetForOvershoot = ctrl ? (ctrl.kind === 'lqr' ? ctrl.targetPos : ctrl.target) : 0;
+    return {
+      motorId: mech.motorBlock.id, solidId: mech.solid.id,
+      controllerId: ctrl?.id ?? null,
+      timeConstant: tConstants[bi],
+      linearDisplay: mech.linearDisplay,
+      peakCurrent: br.peakCurrent,
+      timeToTarget: br.timeToTarget,
+      steadyStateError: ctrl ? br.lastErr : null,
+      overshoot: ctrl
+        ? (targetForOvershoot >= br.startMeas
+            ? Math.max(0, br.measMax - targetForOvershoot)
+            : Math.max(0, targetForOvershoot - br.measMin))
+        : null,
+    };
+  });
 
   return {
-    dt, timeConstant: tauM, steps, channels,
-    data: trimmed, time: trim(time),
-    linearDisplay: c.linearDisplay,
-    timeToTarget, minBusVoltage, peakCurrent,
-    steadyStateError: ctrl ? lastErr : null,
-    overshoot: ctrl
-      ? (targetForOvershoot >= startMeas
-          ? Math.max(0, measMax - targetForOvershoot)
-          : Math.max(0, targetForOvershoot - measMin))
-      : null,
+    dt, steps, channels, data: trimmed, time: trim(time),
+    minBusVoltage, peakCurrent: peakTotalCurrent, mechanisms,
   };
 }
 

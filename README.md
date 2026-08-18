@@ -6,12 +6,7 @@ voltage, brownout risk — instead of a static gear-ratio calculator.
 
 ## Run it
 
-Enter these commands in order
-
 ```bash
-cd (drag your extracted anodized folder in to powersheel)
-cd anodized
-cd anodized
 npm install
 npm run dev
 ```
@@ -45,6 +40,24 @@ solves the gains via a closed-form Riccati solution.
 **It's alive.** The graph re-simulates ~180 ms after any change — no need to
 hit Run after every edit. A block that fails to compile outlines in red on
 the canvas. Click a connection to delete it.
+
+**Output blocks are their own category.** Add as many plotters as you want,
+name them, and wire different measurements into each. The Graphs tab compiles
+every plotter into one stacked view; the Design tab's bottom panel follows
+whichever plotter you have selected.
+
+**Save and load.** Designs export to JSON with a version field, so future
+schema changes can migrate old files rather than silently mis-reading them.
+
+**Multiple mechanisms, one shared battery.** Add a second motor→gear→solid
+chain and it's simulated alongside the first, not ignored. Their motion is
+independent, but their current is not: both draw from the same closed-form
+bus-voltage solve every timestep, so an arm and a flywheel pulling current at
+once sag the SAME bus for both — verified against running each in isolation,
+where the shared-bus case sags deeper than either could reach alone. Two
+motors driving the *same* solid (a differential, a dual-motor merge) is
+rejected with a specific error naming both motors; that's still a real
+feature, just not this one.
 
 ## Layout
 
@@ -86,6 +99,6 @@ algebraic loop, not a control loop.
 
 ## Not built yet
 
-- Save and load
-- Branching topologies — differentials, multiple mechanisms in one graph
+- Branching topologies — differentials, dual-motor merges (two motors driving
+  one shaft is explicitly rejected today, not silently mishandled)
 - Feedforward-only and motion-profiled controllers
