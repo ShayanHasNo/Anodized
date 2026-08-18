@@ -6,7 +6,12 @@ voltage, brownout risk — instead of a static gear-ratio calculator.
 
 ## Run it
 
+Enter these commands in order
+
 ```bash
+cd (drag your extracted anodized folder in to powersheel)
+cd anodized
+cd anodized
 npm install
 npm run dev
 ```
