@@ -18,6 +18,8 @@ npm run dev
 
 Open the URL Vite prints (usually http://localhost:5173).
 
+Or just use the web-app: https://anodized.vercel.app/
+
 ## The idea
 
 **Port shape is the type system.** Circle = rotational, square = linear,
