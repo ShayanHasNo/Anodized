@@ -27,6 +27,27 @@ export interface SimOptions {
   dt?: number;       // override the auto-selected timestep
 }
 
+export interface RunOptions {
+  /** Seconds to pre-allocate for. A live run grows past this as needed. */
+  duration: number;
+  dt?: number;
+}
+
+/**
+ * A resumable simulation. Batch mode advances it to completion in one go; a
+ * live run advances it a chunk at a time against the wall clock, which is the
+ * only difference between the two -- identical physics, identical stepping.
+ */
+export interface Run {
+  readonly dt: number;
+  /** Steps taken so far. */
+  readonly steps: number;
+  /** Advance by n steps, growing buffers if needed. Returns steps actually taken. */
+  advance(n: number): number;
+  /** Current results. Cheap -- returns views over the live buffers. */
+  snapshot(): SimResult;
+}
+
 export interface MechanismResult {
   motorId: string;
   solidId: string;
@@ -93,7 +114,7 @@ interface Branch {
   timeToTarget: number | null;
 }
 
-export function simulate(sys: System, opts: SimOptions): SimResult {
+export function createRun(sys: System, opts: RunOptions): Run {
   const vOc = sys.battery.vOc;
   const rBatt = sys.battery.rBatt; // shared, in series with the TOTAL current
   const rBranch = sys.battery.rBranch; // each branch's own wire/breaker
@@ -136,7 +157,7 @@ export function simulate(sys: System, opts: SimOptions): SimResult {
   // time constant -- since every branch integrates in lockstep.
   const tConstants = sys.mechanisms.map(timeConstant);
   const dt = opts.dt ?? Math.min(1e-3, Math.min(...tConstants) / 20);
-  const maxSteps = Math.ceil(opts.duration / dt) + 1;
+  let capacity = Math.max(64, Math.ceil(opts.duration / dt) + 1);
 
   const channels: Channel[] = [
     ...channelsFor(sys.battery),
@@ -148,14 +169,30 @@ export function simulate(sys: System, opts: SimOptions): SimResult {
     ]),
   ];
   const data: Record<string, Float64Array> = {};
-  for (const ch of channels) data[ch.key] = new Float64Array(maxSteps);
-  const time = new Float64Array(maxSteps);
+  for (const ch of channels) data[ch.key] = new Float64Array(capacity);
+  let time = new Float64Array(capacity);
+
+  /* Doubling growth. A live run has no known end, so the buffers cannot be
+     sized up front -- but reallocating every step would be quadratic, and at
+     1 kHz that shows up as stutter within seconds. */
+  function grow() {
+    capacity *= 2;
+    for (const ch of channels) {
+      const next = new Float64Array(capacity);
+      next.set(data[ch.key]);
+      data[ch.key] = next;
+    }
+    const t2 = new Float64Array(capacity);
+    t2.set(time);
+    time = t2;
+  }
 
   let minBusVoltage = vOc;
   let peakTotalCurrent = 0;
 
   let i = 0;
-  for (; i < maxSteps; i++) {
+  function stepOnce() {
+    if (i >= capacity) grow();
     const t = i * dt;
 
     // ---- pass 1: each branch's controller, independent of the others -------
@@ -362,8 +399,10 @@ export function simulate(sys: System, opts: SimOptions): SimResult {
     data[`${sys.battery.id}.totalCurrent`][i] = totalCurrent;
     if (busVoltage < minBusVoltage) minBusVoltage = busVoltage;
     if (Math.abs(totalCurrent) > Math.abs(peakTotalCurrent)) peakTotalCurrent = totalCurrent;
+    i++;
   }
 
+  function snapshot(): SimResult {
   const steps = i;
   const trim = (a: Float64Array) => a.subarray(0, steps);
   const trimmed: Record<string, Float64Array> = {};
@@ -393,6 +432,24 @@ export function simulate(sys: System, opts: SimOptions): SimResult {
     dt, steps, channels, data: trimmed, time: trim(time),
     minBusVoltage, peakCurrent: peakTotalCurrent, mechanisms,
   };
+  }
+
+  return {
+    dt,
+    get steps() { return i; },
+    advance(n: number) {
+      for (let k = 0; k < n; k++) stepOnce();
+      return n;
+    },
+    snapshot,
+  };
+}
+
+/** Batch helper: run to completion and return the finished result. */
+export function simulate(sys: System, opts: SimOptions): SimResult {
+  const run = createRun(sys, opts);
+  run.advance(Math.ceil(opts.duration / run.dt) + 1);
+  return run.snapshot();
 }
 
 /** Brownout reference lines for the voltage plot. */

@@ -8,13 +8,15 @@ import '@xyflow/react/dist/style.css';
 
 import { Block, PortType, canConnect, portsFor, channelsFor, Edge as SimEdge } from './sim/blocks';
 import { compile, inertia, CompileError, type MechanismGroup } from './sim/compile';
-import { simulate, SimResult } from './sim/solver';
+import { simulate, createRun, type Run, type SimResult } from './sim/solver';
 import { nodeTypes, TYPE_COLOR } from './canvas/nodes';
 import { edgeTypes } from './canvas/edges';
 import { Inspector } from './Inspector';
 import { Library } from './Library';
-import { serialize, deserialize, highestIdSuffix, downloadJson } from './persist';
+import { serialize, deserialize, highestIdSuffix, downloadJson, filenameFor } from './persist';
 import { dimensionOf, conversionFactor, unitLabel } from './sim/units';
+import { MotionView, type MotionMech } from './motion/MotionView';
+import { archetypeFor } from './motion/archetypes';
 import { Chart, Series } from './Chart';
 
 /* Trace colours follow unit family, using the same palette as the ports, so a
@@ -143,10 +145,16 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [errorBlockId, setErrorBlockId] = useState<string | null>(null);
   const [showLibrary, setShowLibrary] = useState(false);
-  const [view, setView] = useState<'canvas' | 'graphs'>('canvas');
+  const [view, setView] = useState<'canvas' | 'graphs' | 'motion'>('canvas');
+  const [frame, setFrame] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [duration, setDuration] = useState(1.5);
+  const [designName, setDesignName] = useState('Untitled design');
+  const [runMode, setRunMode] = useState<'fixed' | 'live'>('fixed');
+  const [liveRunning, setLiveRunning] = useState(false);
+  const liveRun = useRef<Run | null>(null);
+  const liveRaf = useRef<number | null>(null);
   interface CompiledMechanismInfo {
     motorId: string; solidId: string;
     ratio: number; efficiency: number; inertiaSolid: number; linear: boolean;
@@ -310,6 +318,7 @@ export default function App() {
       // No global target any more: a controller block owns its own setpoint.
       const r = simulate(sys, { duration });
       setResult(r);
+      setFrame((f) => (f >= r.steps ? 0 : f));
       setError(null);
       setErrorBlockId(null);
       setCompiled({
@@ -334,9 +343,69 @@ export default function App() {
      drag or a fast typed number does not trigger a solve on every keystroke;
      the button stays as an explicit, immediate re-run. */
   useEffect(() => {
+    if (runMode === 'live') return;
     const t = setTimeout(run, 180);
     return () => clearTimeout(t);
-  }, [run]);
+  }, [run, runMode]);
+
+  /* Live mode advances one shared Run against the wall clock instead of
+     solving a fixed window up front. Same solver, same stepping -- the only
+     difference is that nothing decides in advance when to stop. */
+  useEffect(() => {
+    if (runMode !== 'live' || !liveRunning) return;
+    let cancelled = false;
+    try {
+      const simEdges: SimEdge[] = edges
+        .filter((e) => blockById.has(e.source) && blockById.has(e.target))
+        .map((e) => ({
+          from: { blockId: e.source, portId: e.sourceHandle ?? 'out' },
+          to: { blockId: e.target, portId: e.targetHandle ?? 'in' },
+        }));
+      const sys = compile(blocks, simEdges, groups);
+      const r = createRun(sys, { duration: 2 });
+      liveRun.current = r;
+      setError(null);
+      setErrorBlockId(null);
+      setCompiled({
+        mechanisms: sys.mechanisms.map((m) => ({
+          motorId: m.motorBlock.id, solidId: m.solid.id,
+          ratio: m.ratio, efficiency: m.efficiency, inertiaSolid: m.inertiaSolid,
+          linear: m.linearDisplay,
+          lqr: (m.controller?.kind === 'lqr' && m.lqrGains)
+            ? { blockId: m.controller.id, k1: m.lqrGains.k1, k2: m.lqrGains.k2 }
+            : null,
+        })),
+      });
+
+      let last = performance.now();
+      let carry = 0;
+      const tick = (now: number) => {
+        if (cancelled) return;
+        carry += (now - last) / 1000;
+        last = now;
+        // Cap the catch-up so a backgrounded tab does not return and try to
+        // simulate the entire time it was away in one frame.
+        const advance = Math.min(Math.floor(carry / r.dt), Math.ceil(0.25 / r.dt));
+        if (advance > 0) {
+          carry -= advance * r.dt;
+          r.advance(advance);
+          const snap = r.snapshot();
+          setResult(snap);
+          setFrame(snap.steps - 1);
+        }
+        liveRaf.current = requestAnimationFrame(tick);
+      };
+      liveRaf.current = requestAnimationFrame(tick);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setErrorBlockId(e instanceof CompileError ? e.blockId ?? null : null);
+      setLiveRunning(false);
+    }
+    return () => {
+      cancelled = true;
+      if (liveRaf.current !== null) cancelAnimationFrame(liveRaf.current);
+    };
+  }, [runMode, liveRunning, blocks, edges, blockById, groups]);
 
   /* Series are built per plotter, so each one gets its own independent pair of
      axes. Unit families are assigned to axes in the order they appear within
@@ -401,6 +470,53 @@ export default function App() {
   const series = focusedPlotterId ? seriesByPlotter.get(focusedPlotterId) ?? [] : [];
   const focusedEdges = plotterEdges.filter((e) => e.target === focusedPlotterId);
   const droppedSeries = focusedEdges.length - series.length;
+
+  /* One animatable entry per simulated mechanism. Position comes straight from
+     the recorded trajectory, so the animation is the simulation -- not a
+     re-derivation that could drift from it. */
+  const motionMechs = useMemo((): MotionMech[] => {
+    if (!result) return [];
+    return result.mechanisms.map((m) => {
+      const solid = blockById.get(m.solidId) as Extract<Block, { kind: 'solid' }> | undefined;
+      const pos = result.data[`${m.solidId}.position`];
+      const vel = result.data[`${m.solidId}.velocity`];
+      if (!solid || !pos || !vel) return null;
+
+      const chans = channelsFor(solid);
+      const posUnit = chans.find((c) => c.key.endsWith('.position'))!.unit;
+      const velUnit = chans.find((c) => c.key.endsWith('.velocity'))!.unit;
+      const archetype = archetypeFor(solid);
+
+      // Renderers work in SI -- radians for rotation, metres for travel.
+      const toBase = archetype === 'elevator' ? 1 : conversionFactor(posUnit, 'rad');
+
+      // A controller's setpoint only makes sense as a pose marker when it
+      // tracks position; a velocity setpoint is shown as a readout instead.
+      const ctrl = m.controllerId ? blockById.get(m.controllerId) : undefined;
+      let setpoint: number | null = null;
+      let velocitySetpoint: number | null = null;
+      if (ctrl && (ctrl.kind === 'pid' || ctrl.kind === 'bangbang')) {
+        if (ctrl.source?.endsWith('.velocity')) velocitySetpoint = ctrl.target;
+        else setpoint = ctrl.target;
+      } else if (ctrl && ctrl.kind === 'lqr') {
+        setpoint = ctrl.targetPos;
+      }
+
+      let lo = Infinity, hi = -Infinity;
+      for (let k = 0; k < pos.length; k++) {
+        if (pos[k] < lo) lo = pos[k];
+        if (pos[k] > hi) hi = pos[k];
+      }
+      if (setpoint !== null) { lo = Math.min(lo, setpoint); hi = Math.max(hi, setpoint); }
+
+      return {
+        id: m.solidId, label: m.solidId, archetype,
+        position: pos, toBase, positionUnit: posUnit,
+        velocity: vel, velocityUnit: velUnit,
+        setpoint, velocitySetpoint, posMin: lo, posMax: hi,
+      } as MotionMech;
+    }).filter((x): x is MotionMech => x !== null);
+  }, [result, blockById]);
 
   /* Rendering-only merges: the failing block gets a red-flag, the LQR block
      gets its computed gains, and each plotter gets its live series count --
@@ -498,7 +614,7 @@ export default function App() {
     setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, title } } : n)));
 
   const onSave = () => {
-    downloadJson('anodized-design.json', serialize(nodes, edges, duration));
+    downloadJson(filenameFor(designName), serialize(nodes, edges, duration, designName));
   };
 
   const onLoadFile = async (file: File) => {
@@ -507,6 +623,7 @@ export default function App() {
       setNodes(parsed.nodes);
       setEdges(parsed.edges);
       setDuration(parsed.duration);
+      setDesignName(parsed.name);
       // Clear the id counter past everything in the file, or the next block
       // added would collide with one that was just loaded.
       bumpUid(highestIdSuffix(parsed.nodes));
@@ -524,6 +641,15 @@ export default function App() {
     <div className="shell">
       <header className="topbar">
         <div className="wordmark">Ano<span>dized</span></div>
+        <input
+          className="design-name"
+          value={designName}
+          onChange={(e) => setDesignName(e.target.value)}
+          onFocus={(e) => e.target.select()}
+          placeholder="Untitled design"
+          aria-label="Design name"
+          title="Names the file when you save"
+        />
         <div className={`chainstrip${error ? ' err' : ''}`}>
           {error ? error : compiled ? (
             compiled.mechanisms.length === 1 ? (
@@ -555,6 +681,8 @@ export default function App() {
             onClick={() => setView('graphs')}>
             Graphs{plotterNodes.length > 1 ? ` (${plotterNodes.length})` : ''}
           </button>
+          <button className={`tab${view === 'motion' ? ' on' : ''}`}
+            onClick={() => setView('motion')}>Motion</button>
         </div>
         <button className="btn" onClick={onSave}>Save</button>
         <button className="btn" onClick={() => fileRef.current?.click()}>Load</button>
@@ -568,8 +696,21 @@ export default function App() {
           }}
         />
         <button className="btn" onClick={() => setShowLibrary(true)}>Library</button>
-        <span className="stat" style={{ color: 'var(--ink-3)' }}>live</span>
-        <button className="btn primary" onClick={run}>Run now</button>
+        {runMode === 'fixed' ? (
+          <>
+            <span className="stat" style={{ color: 'var(--ink-3)' }}>auto</span>
+            <button className="btn primary" onClick={run}>Run now</button>
+          </>
+        ) : (
+          <>
+            <span className="stat num" style={{ color: 'var(--ink-3)' }}>
+              {result ? `${(result.time[result.steps - 1] ?? 0).toFixed(1)}s` : '0.0s'}
+            </span>
+            <button className="btn primary" onClick={() => setLiveRunning((v) => !v)}>
+              {liveRunning ? 'Stop' : 'Start'}
+            </button>
+          </>
+        )}
       </header>
 
       {loadError && (
@@ -630,6 +771,22 @@ export default function App() {
 
           <h2 className="railhead">Run settings</h2>
           <div className="field">
+            <label>Mode</label>
+            <select value={runMode}
+              onChange={(e) => {
+                setLiveRunning(false);
+                setRunMode(e.target.value as 'fixed' | 'live');
+              }}>
+              <option value="fixed">Fixed duration</option>
+              <option value="live">Real time</option>
+            </select>
+            <div className="hint">
+              {runMode === 'fixed'
+                ? 'Solves the whole window instantly, then re-solves as you edit.'
+                : 'Advances against the wall clock with no end. Edits restart the run.'}
+            </div>
+          </div>
+          <div className="field" style={{ display: runMode === 'fixed' ? undefined : 'none' }}>
             <label>Duration (s)</label>
             <input type="number" value={duration} step={0.25} min={0.1}
               onChange={(e) => setDuration(Math.max(0.1, parseFloat(e.target.value) || 0.1))} />
@@ -651,6 +808,11 @@ export default function App() {
               <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#333b41" />
               <Controls showInteractive={false} />
             </ReactFlow>
+          </div>
+        ) : view === 'motion' ? (
+          <div className="graphs-wrap">
+            <MotionView mechs={motionMechs} time={result?.time ?? new Float64Array()}
+              index={frame} onIndex={setFrame} />
           </div>
         ) : (
           <div className="graphs-wrap">

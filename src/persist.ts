@@ -8,6 +8,8 @@ import type { Node, Edge as RFEdge } from '@xyflow/react';
 export const SAVE_VERSION = 1;
 
 export interface SaveFile {
+  /** What the person called this design. Becomes the download filename. */
+  name: string;
   version: number;
   app: 'anodized';
   savedAt: string;
@@ -16,10 +18,13 @@ export interface SaveFile {
   edges: RFEdge[];
 }
 
-export function serialize(nodes: Node[], edges: RFEdge[], duration: number): string {
+export function serialize(
+  nodes: Node[], edges: RFEdge[], duration: number, name: string,
+): string {
   const file: SaveFile = {
     version: SAVE_VERSION,
     app: 'anodized',
+    name: name.trim() || 'Untitled design',
     savedAt: new Date().toISOString(),
     duration,
     // Strip React Flow's transient UI state -- selection, drag flags, and
@@ -62,6 +67,9 @@ export function deserialize(text: string): SaveFile {
   return {
     version: f.version,
     app: 'anodized',
+    // Files saved before names existed still load -- they just come back
+    // untitled rather than being rejected.
+    name: typeof f.name === 'string' && f.name.trim() ? f.name : 'Untitled design',
     savedAt: f.savedAt ?? '',
     duration: typeof f.duration === 'number' ? f.duration : 1.5,
     nodes: f.nodes,
@@ -81,6 +89,21 @@ export function highestIdSuffix(nodes: Node[]): number {
     if (m) max = Math.max(max, parseInt(m[1], 10));
   }
   return max;
+}
+
+/**
+ * Turn a design name into a safe download filename. Browsers and filesystems
+ * disagree about which characters are legal, so strip to a conservative set
+ * rather than trusting whatever was typed.
+ */
+export function filenameFor(name: string): string {
+  const clean = name.trim()
+    .replace(/[^a-zA-Z0-9 _-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 60);
+  return `${clean || 'anodized-design'}.json`;
 }
 
 export function downloadJson(filename: string, text: string) {

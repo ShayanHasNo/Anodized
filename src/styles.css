@@ -74,6 +74,22 @@ body {
 }
 .wordmark span { color: var(--rotational); }
 
+.design-name {
+  font-family: var(--sans); font-size: 13px; font-weight: 500;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r);
+  padding: 5px 8px;
+  width: 180px; flex: 0 0 auto;
+}
+.design-name:hover { border-color: var(--line); }
+.design-name:focus {
+  outline: none; background: var(--panel-0);
+  border-color: var(--rotational);
+}
+.design-name::placeholder { color: var(--ink-3); font-weight: 400; }
+
 /* The compiled chain, shown as the flat numbers the solver actually uses.
    This strip is the conceptual centre of the tool: however many blocks you
    drag out, they collapse to these. */
@@ -388,6 +404,33 @@ body {
 .graphcard-title {
   font-family: var(--cond); font-size: 13px; font-weight: 600;
   letter-spacing: 0.06em; color: var(--ink); margin: 0;
+}
+
+/* ---------- motion ---------- */
+
+.motion-wrap { display: flex; flex-direction: column; gap: 14px; }
+.motion-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  background: var(--panel-1); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 10px 14px;
+}
+.motion-grid {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+.motion-card {
+  background: var(--panel-1); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 10px 14px 12px;
+}
+.motion-head {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px;
+}
+.motion-stage {
+  background: var(--panel-0); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 6px;
+}
+.motion-readout {
+  display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px;
 }
 
 /* ---------- library ---------- */

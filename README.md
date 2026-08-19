@@ -25,21 +25,23 @@ every port and block.
 because converting rotation to travel is a real change of domain. Try wiring
 an elevator straight to a gearbox and the compiler tells you to add one.
 
+**One solid block covers three mechanisms.** Flywheel, elevator, and arm
+differ only in *gravity mode* (none / constant / angle-dependent). There's no
+per-mechanism code in the solver — everything runs in the rotational domain,
+and metres only reappear at plot time.
 
-**Controllers** 
-PID, bang-bang, and LQR all read a
+**Controllers are their own category.** PID, bang-bang, and LQR all read a
 measurement through a hexagon input and drive a motor through a bar port,
 closing a real feedback loop inside every timestep. PID and bang-bang pick a
 position or velocity channel to track; LQR reads shaft state directly and
 derives its own plant from the attached chain — you set costs (Q, R), it
 solves the gains via a closed-form Riccati solution.
 
-**QOL Feautures** The graph re-simulates ~180 ms after any change — no need to
+**It's alive.** The graph re-simulates ~180 ms after any change — no need to
 hit Run after every edit. A block that fails to compile outlines in red on
 the canvas. Click a connection to delete it.
 
-**Output blocks.** 
-Add as many plotters as you want,
+**Output blocks are their own category.** Add as many plotters as you want,
 name them, and wire different measurements into each. The Graphs tab compiles
 every plotter into one stacked view; the Design tab's bottom panel follows
 whichever plotter you have selected.
