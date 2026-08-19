@@ -1,6 +1,7 @@
 import { Block } from './sim/blocks';
 import { MOTORS } from './sim/motors';
 import { inertia } from './sim/compile';
+import { UNITS_BY_DIMENSION, DEFAULT_UNIT, conversionFactor } from './sim/units';
 import { KIND_ACCENT } from './canvas/nodes';
 
 function Num({
@@ -180,11 +181,56 @@ export function Inspector({
           )}
           <Num label="Friction (N·m)" value={block.friction} step={0.1} min={0}
             onChange={(v) => set('friction', v)} hint="Coulomb friction at the output shaft" />
+
+          {(() => {
+            const linear = block.gravityMode === 'constant';
+            const posDim = linear ? 'length' : 'angle';
+            const velDim = linear ? 'linearRate' : 'angularRate';
+            const posUnit = block.positionUnit ?? DEFAULT_UNIT[posDim];
+            const velUnit = block.velocityUnit ?? DEFAULT_UNIT[velDim];
+            return (
+              <div className="field row2">
+                <div>
+                  <label>Position unit</label>
+                  <select value={posUnit} onChange={(e) => {
+                    // Convert the stored start position so the mechanism does
+                    // not silently move when the unit changes underneath it.
+                    const f = conversionFactor(posUnit, e.target.value);
+                    onChange({
+                      ...block, positionUnit: e.target.value,
+                      initialPosition: block.initialPosition * f,
+                    } as Block);
+                  }}>
+                    {UNITS_BY_DIMENSION[posDim].map((u) => (
+                      <option key={u.id} value={u.id}>{u.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label>Velocity unit</label>
+                  <select value={velUnit}
+                    onChange={(e) => set('velocityUnit', e.target.value)}>
+                    {UNITS_BY_DIMENSION[velDim].map((u) => (
+                      <option key={u.id} value={u.id}>{u.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            );
+          })()}
+          <div className="hint" style={{ marginBottom: 11 }}>
+            Units are display-only — the solver always works in SI, so changing
+            one relabels the channels and rescales the numbers without touching
+            the physics. A controller tracking this mechanism reads its setpoint
+            in whichever unit the channel it follows is set to.
+          </div>
+
           <Num
-            label={block.gravityMode === 'constant' ? 'Start position (m)' : 'Start angle (deg)'}
-            value={block.initialPosition} step={block.gravityMode === 'constant' ? 0.05 : 5}
+            label={`Start position (${block.positionUnit ?? (block.gravityMode === 'constant' ? 'm' : 'deg')})`}
+            value={block.initialPosition}
+            step={block.gravityMode === 'constant' ? 0.05 : 5}
             onChange={(v) => set('initialPosition', v)}
-            hint={block.gravityMode === 'angleDependent' ? '0 is horizontal, 90 is straight up' : undefined}
+            hint={block.gravityMode === 'angleDependent' ? '0 is horizontal, 90° is straight up' : undefined}
           />
         </>
       )}

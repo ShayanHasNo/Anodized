@@ -102,6 +102,14 @@ export interface SolidBlock {
   /** Coulomb friction torque at the output shaft, N-m. */
   friction: number;
   /**
+   * Display units for this mechanism's position and velocity channels. The
+   * solver never sees these -- they only affect what channels report, what a
+   * controller setpoint is written in, and how a chart is labelled.
+   * Defaults: deg / deg-per-second rotational, m / m-per-second linear.
+   */
+  positionUnit?: string;
+  velocityUnit?: string;
+  /**
    * Starting position in DISPLAY units: degrees for rotational chains
    * (0 = horizontal for an arm), metres for linear ones.
    */
@@ -251,10 +259,12 @@ export function channelsFor(block: Block): Channel[] {
       ];
     case 'solid': {
       const linear = block.gravityMode === 'constant';
+      const posUnit = block.positionUnit ?? (linear ? 'm' : 'deg');
+      const velUnit = block.velocityUnit ?? (linear ? 'm/s' : 'deg/s');
       return [
-        { key: p('position'), label: 'Position', unit: linear ? 'm' : 'deg', family: linear ? 'length' : 'angle' },
-        { key: p('velocity'), label: 'Velocity', unit: linear ? 'm/s' : 'deg/s', family: linear ? 'linearRate' : 'angularRate' },
-        { key: p('acceleration'), label: 'Acceleration', unit: linear ? 'm/s^2' : 'deg/s^2', family: linear ? 'linearRate' : 'angularRate' },
+        { key: p('position'), label: 'Position', unit: posUnit, family: linear ? 'length' : 'angle' },
+        { key: p('velocity'), label: 'Velocity', unit: velUnit, family: linear ? 'linearRate' : 'angularRate' },
+        { key: p('acceleration'), label: 'Acceleration', unit: `${velUnit}²`, family: linear ? 'linearRate' : 'angularRate' },
         { key: p('gravityTorque'), label: 'Gravity torque', unit: 'N-m', family: 'torque' },
       ];
     }

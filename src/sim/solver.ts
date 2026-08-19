@@ -21,7 +21,6 @@
 import { System, Mechanism, G_ACCEL } from './compile';
 import { Channel, channelsFor } from './blocks';
 
-const RAD_TO_DEG = 180 / Math.PI;
 
 export interface SimOptions {
   duration: number; // seconds
@@ -78,6 +77,7 @@ interface Branch {
   eta: number;
   jEff: number;
   posScale: number;
+  velScale: number;
   gearCum: { ratio: number; eff: number }[];
   measure: (theta: number, omega: number) => number;
   // mutable per-step state
@@ -101,7 +101,8 @@ export function simulate(sys: System, opts: SimOptions): SimResult {
   const branches: Branch[] = sys.mechanisms.map((mech) => {
     const n = mech.motorBlock.count;
     const { R: Rm, Kt, Kv } = mech.motor;
-    const posScale = mech.linearDisplay ? mech.radius! : RAD_TO_DEG;
+    const posScale = mech.posScale;
+    const velScale = mech.velScale;
 
     const gearCum: { ratio: number; eff: number }[] = [];
     {
@@ -113,16 +114,18 @@ export function simulate(sys: System, opts: SimOptions): SimResult {
       }
     }
 
+    // Each readable channel reports in its OWN unit, so the controller's
+    // setpoint is read in whatever unit the channel it tracks is set to.
     const measure = (theta: number, omega: number): number => {
       if (!mech.errorSource) return 0;
       if (mech.errorSource === `${mech.motorBlock.id}.speed`) return omega * mech.ratio;
-      if (mech.errorSource.endsWith('.velocity')) return omega * posScale;
+      if (mech.errorSource.endsWith('.velocity')) return omega * velScale;
       return theta * posScale;
     };
 
     return {
       mech, n, R: Rm + rBranch, Kt, Kv, G: mech.ratio, eta: mech.efficiency,
-      jEff: mech.jEffOutput, posScale, gearCum, measure,
+      jEff: mech.jEffOutput, posScale, velScale, gearCum, measure,
       theta: mech.theta0, omega: 0, integral: 0, prevMeas: NaN,
       measMin: Infinity, measMax: -Infinity, lastErr: 0,
       startMeas: mech.theta0 * posScale, peakCurrent: 0, timeToTarget: null,
@@ -196,6 +199,10 @@ export function simulate(sys: System, opts: SimOptions): SimResult {
         duty = bbOut;
       } else if (ctrl && ctrl.kind === 'lqr' && mech.lqrGains) {
         const lqr = ctrl;
+        // LQR regulates a two-element state, so both components have to share
+        // a consistent scale or the gain solve stops being valid. It works in
+        // position units and position-units-per-second regardless of what the
+        // velocity CHANNEL is set to display -- targetVel is in posUnit/s.
         const posMeas = br.theta * br.posScale;
         const velMeas = br.omega * br.posScale;
         lqrPosErr = lqr.targetPos - posMeas;
@@ -295,8 +302,8 @@ export function simulate(sys: System, opts: SimOptions): SimResult {
       }
 
       data[`${mech.solid.id}.position`][i] = br.theta * br.posScale;
-      data[`${mech.solid.id}.velocity`][i] = br.omega * br.posScale;
-      data[`${mech.solid.id}.acceleration`][i] = alpha * br.posScale;
+      data[`${mech.solid.id}.velocity`][i] = br.omega * br.velScale;
+      data[`${mech.solid.id}.acceleration`][i] = alpha * br.velScale;
       data[`${mech.solid.id}.gravityTorque`][i] = tauGrav;
 
       const ctrl = mech.controller;

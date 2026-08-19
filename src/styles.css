@@ -314,6 +314,42 @@ body {
   * { transition: none !important; animation: none !important; }
 }
 
+/* ---------- mechanism boxes ---------- */
+
+.mech-group {
+  width: 100%; height: 100%;
+  border: 1px dashed var(--line-bright);
+  border-radius: 6px;
+  background: rgba(120, 134, 145, 0.055);
+  position: relative;
+}
+.mech-group.sel { border-color: var(--ink-3); border-style: solid; }
+.mech-group.err {
+  border-color: var(--danger); border-style: solid;
+  background: rgba(224, 96, 74, 0.07);
+}
+.mech-group-tab {
+  position: absolute; top: -11px; left: 12px;
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 2px 9px;
+  background: var(--panel-0);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+.mech-group.err .mech-group-tab { border-color: var(--danger); }
+.mech-group-label {
+  font-family: var(--cond); font-size: 11px; font-weight: 600;
+  letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-2);
+}
+.mech-group.err .mech-group-label { color: var(--danger); }
+
+.group-resize-line { border-color: var(--ink-3) !important; }
+.group-resize-handle {
+  background: var(--panel-2) !important;
+  border: 1px solid var(--line-bright) !important;
+  width: 8px !important; height: 8px !important; border-radius: 2px !important;
+}
+
 /* ---------- tabs, graphs view, load errors ---------- */
 
 .tabs { display: flex; gap: 2px; background: var(--panel-0); padding: 2px; border-radius: var(--r); }

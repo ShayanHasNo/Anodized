@@ -1,4 +1,4 @@
-import { Handle, Position, NodeProps } from '@xyflow/react';
+import { Handle, Position, NodeResizer, NodeProps } from '@xyflow/react';
 import { Block, PortType } from '../sim/blocks';
 import { MOTORS } from '../sim/motors';
 
@@ -220,6 +220,29 @@ export function LqrNode({ data, id, selected }: NodeProps) {
   );
 }
 
+export function GroupNode({ id, selected, data }: NodeProps) {
+  const d = data as Record<string, unknown>;
+  const label = (d.label as string) || 'Mechanism';
+  const hasError = d.hasError as boolean | undefined;
+  const count = (d.memberCount as number) ?? 0;
+  return (
+    <>
+      <NodeResizer
+        minWidth={260} minHeight={170}
+        isVisible={selected}
+        lineClassName="group-resize-line"
+        handleClassName="group-resize-handle"
+      />
+      <div className={`mech-group${selected ? ' sel' : ''}${hasError ? ' err' : ''}`}>
+        <div className="mech-group-tab">
+          <span className="mech-group-label">{label}</span>
+          <span className="node-id">{count === 0 ? 'empty' : `${count} blocks`}</span>
+        </div>
+      </div>
+    </>
+  );
+}
+
 export const nodeTypes = {
   battery: BatteryNode,
   motor: MotorNode,
@@ -229,4 +252,5 @@ export const nodeTypes = {
   pid: PidNode,
   bangbang: BangBangNode,
   lqr: LqrNode,
+  group: GroupNode,
 };

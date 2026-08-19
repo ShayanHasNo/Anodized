@@ -26,6 +26,8 @@ export function serialize(nodes: Node[], edges: RFEdge[], duration: number): str
     // measured sizes are re-derived on load and only bloat the file.
     nodes: nodes.map((n) => ({
       id: n.id, type: n.type, position: n.position, data: n.data,
+      // Mechanism boxes are resizable, so their size is real state.
+      width: n.width, height: n.height, style: n.style,
     })) as Node[],
     edges: edges.map((e) => ({
       id: e.id, source: e.source, sourceHandle: e.sourceHandle,

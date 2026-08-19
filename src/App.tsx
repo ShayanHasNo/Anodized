@@ -2,18 +2,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow, Background, Controls, BackgroundVariant,
   useNodesState, useEdgesState, addEdge,
-  type Connection, type Node, type Edge as RFEdge,
+  type Connection, type Node, type NodeChange, type Edge as RFEdge,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
 import { Block, PortType, canConnect, portsFor, channelsFor, Edge as SimEdge } from './sim/blocks';
-import { compile, inertia, CompileError } from './sim/compile';
+import { compile, inertia, CompileError, type MechanismGroup } from './sim/compile';
 import { simulate, SimResult } from './sim/solver';
 import { nodeTypes, TYPE_COLOR } from './canvas/nodes';
 import { edgeTypes } from './canvas/edges';
 import { Inspector } from './Inspector';
 import { Library } from './Library';
 import { serialize, deserialize, highestIdSuffix, downloadJson } from './persist';
+import { dimensionOf, conversionFactor, unitLabel } from './sim/units';
 import { Chart, Series } from './Chart';
 
 /* Trace colours follow unit family, using the same palette as the ports, so a
@@ -96,9 +97,15 @@ function initialGraph(): { nodes: Node[]; edges: RFEdge[] } {
     ({ id: b.id, type: b.kind, position: { x, y }, data: { block: b } });
 
   const nodes: Node[] = [
+    // The box goes first so it renders behind the blocks it holds. It wraps
+    // the motor, gear, solid and controller -- but deliberately not the
+    // battery, which is shared across every mechanism.
+    { id: 'mech0', type: 'group', position: { x: 210, y: 55 },
+      width: 700, height: 340,
+      data: { label: 'Arm', moveContents: true }, zIndex: -1 },
     mk(batt, 20, 40), mk(motor, 250, 100), mk(gear, 480, 100), mk(solid, 710, 100),
     mk(pid, 250, 300),
-    { id: 'plot1', type: 'plotter', position: { x: 620, y: 320 },
+    { id: 'plot1', type: 'plotter', position: { x: 620, y: 440 },
       data: { title: 'Position vs setpoint', seriesCount: 2 } },
   ];
   const edges: RFEdge[] = [
@@ -148,7 +155,9 @@ export default function App() {
   const [compiled, setCompiled] = useState<{ mechanisms: CompiledMechanismInfo[] } | null>(null);
 
   const blocks = useMemo(
-    () => nodes.filter((n) => n.type !== 'plotter').map((n) => (n.data as { block: Block }).block),
+    () => nodes
+      .filter((n) => n.type !== 'plotter' && n.type !== 'group')
+      .map((n) => (n.data as { block: Block }).block),
     [nodes],
   );
   const blockById = useMemo(() => new Map(blocks.map((b) => [b.id, b])), [blocks]);
@@ -246,6 +255,42 @@ export default function App() {
 
   /* --- run ---------------------------------------------------------------- */
 
+  /* Membership is geometric: a block belongs to whichever box its centre sits
+     inside. Deriving it from position rather than storing a parent link means
+     dragging a block in or out just works, with no stale references to clean
+     up when a box is deleted. */
+  const groupNodes = useMemo(() => nodes.filter((n) => n.type === 'group'), [nodes]);
+
+  const groups = useMemo((): MechanismGroup[] => groupNodes.map((g) => {
+    const gx = g.position.x, gy = g.position.y;
+    const gw = (g.width ?? (g.style?.width as number) ?? 420);
+    const gh = (g.height ?? (g.style?.height as number) ?? 240);
+    const memberIds = nodes
+      .filter((n) => n.type !== 'group' && n.type !== 'plotter')
+      .filter((n) => {
+        const cx = n.position.x + (n.width ?? 172) / 2;
+        const cy = n.position.y + (n.height ?? 80) / 2;
+        return cx >= gx && cx <= gx + gw && cy >= gy && cy <= gy + gh;
+      })
+      .map((n) => n.id);
+    return { id: g.id, label: ((g.data as Record<string, unknown>).label as string) || 'Mechanism', memberIds };
+  }), [groupNodes, nodes]);
+
+  /** Everything visually inside a box, plotters included -- used for dragging. */
+  const visualMembers = useCallback((g: Node): string[] => {
+    const gx = g.position.x, gy = g.position.y;
+    const gw = (g.width ?? (g.style?.width as number) ?? 620);
+    const gh = (g.height ?? (g.style?.height as number) ?? 210);
+    return nodes
+      .filter((n) => n.type !== 'group')
+      .filter((n) => {
+        const cx = n.position.x + (n.width ?? 172) / 2;
+        const cy = n.position.y + (n.height ?? 80) / 2;
+        return cx >= gx && cx <= gx + gw && cy >= gy && cy <= gy + gh;
+      })
+      .map((n) => n.id);
+  }, [nodes]);
+
   const plotterNodes = useMemo(() => nodes.filter((n) => n.type === 'plotter'), [nodes]);
   const plotterIds = useMemo(() => new Set(plotterNodes.map((n) => n.id)), [plotterNodes]);
   const plotterEdges = useMemo(
@@ -261,7 +306,7 @@ export default function App() {
           from: { blockId: e.source, portId: e.sourceHandle ?? 'out' },
           to: { blockId: e.target, portId: e.targetHandle ?? 'in' },
         }));
-      const sys = compile(blocks, simEdges);
+      const sys = compile(blocks, simEdges, groups);
       // No global target any more: a controller block owns its own setpoint.
       const r = simulate(sys, { duration });
       setResult(r);
@@ -282,7 +327,7 @@ export default function App() {
       setErrorBlockId(e instanceof CompileError ? e.blockId ?? null : null);
       setResult(null);
     }
-  }, [edges, blockById, blocks, duration]);
+  }, [edges, blockById, blocks, duration, groups]);
 
   /* Live tuning: re-run automatically a beat after anything changes, rather
      than making the person click Run after every field edit. Debounced so a
@@ -319,7 +364,26 @@ export default function App() {
         data: result.data[key], axis: ax as 0 | 1,
       });
     }
-    return out;
+
+    /* Two channels measuring the same physical dimension in different units --
+       one mechanism reporting RPM, another deg/s -- would otherwise be drawn
+       against a shared axis as if the numbers were comparable. Convert every
+       such series onto the first one's unit so the axis means one thing. */
+    const canonical = new Map<string, string>();
+    for (const s of out) {
+      const dim = dimensionOf(s.unit);
+      if (dim && !canonical.has(dim)) canonical.set(dim, s.unit);
+    }
+    return out.map((s) => {
+      const dim = dimensionOf(s.unit);
+      if (!dim) return s;
+      const target = canonical.get(dim)!;
+      if (target === s.unit) return s;
+      const f = conversionFactor(s.unit, target);
+      const scaled = new Float64Array(s.data.length);
+      for (let i = 0; i < s.data.length; i++) scaled[i] = s.data[i] * f;
+      return { ...s, data: scaled, unit: target, label: `${s.label} (${unitLabel(s.unit)})` };
+    });
   }, [result, plotterEdges]);
 
   const seriesByPlotter = useMemo(
@@ -349,13 +413,17 @@ export default function App() {
         const count = plotterEdges.filter((e) => e.target === n.id).length;
         return { ...n, data: { ...n.data, seriesCount: count } };
       }
+      if (n.type === 'group') {
+        const g = groups.find((x) => x.id === n.id);
+        return { ...n, data: { ...n.data, memberCount: g?.memberIds.length ?? 0 } };
+      }
       const lqrHere = compiled?.mechanisms.find((m) => m.lqr?.blockId === n.id)?.lqr;
       if (lqrHere) {
         return { ...n, data: { ...n.data, gains: { k1: lqrHere.k1, k2: lqrHere.k2 } } };
       }
       return n;
     }),
-    [nodes, errorBlockId, compiled, plotterEdges],
+    [nodes, errorBlockId, compiled, plotterEdges, groups],
   );
 
   /* --- plotters, save, load ------------------------------------------------ */
@@ -369,6 +437,62 @@ export default function App() {
     }));
     setSelected(id);
   };
+
+  /* Dragging a box carries its contents. Membership is geometric, so it has to
+     be snapshotted when the drag STARTS -- recomputing each frame would let
+     blocks fall out of the box the moment it moved off them, and they would
+     stop following partway through the drag. */
+  const dragMembers = useRef<Map<string, string[]>>(new Map());
+
+  const handleNodesChange = useCallback((changes: NodeChange[]) => {
+    const extra: NodeChange[] = [];
+    for (const c of changes) {
+      if (c.type !== 'position') continue;
+      const g = nodes.find((n) => n.id === c.id && n.type === 'group');
+      if (!g) continue;
+
+      if (c.dragging === false) { dragMembers.current.delete(c.id); continue; }
+      if ((g.data as Record<string, unknown>).moveContents === false) continue;
+      if (!c.position) continue;
+
+      let members = dragMembers.current.get(c.id);
+      if (!members) { members = visualMembers(g); dragMembers.current.set(c.id, members); }
+
+      const dx = c.position.x - g.position.x;
+      const dy = c.position.y - g.position.y;
+      if (dx === 0 && dy === 0) continue;
+
+      for (const id of members) {
+        // Never fight an explicit change already in this batch.
+        if (changes.some((cc) => cc.type === 'position' && cc.id === id)) continue;
+        const n = nodes.find((nn) => nn.id === id);
+        if (!n) continue;
+        extra.push({
+          type: 'position', id,
+          position: { x: n.position.x + dx, y: n.position.y + dy },
+          dragging: c.dragging,
+        });
+      }
+    }
+    onNodesChange(extra.length ? [...changes, ...extra] : changes);
+  }, [nodes, visualMembers, onNodesChange]);
+
+  const addGroup = () => {
+    const id = nextId('mech');
+    setNodes((ns) => [
+      // Boxes go first in the array so they render behind the blocks they hold.
+      { id, type: 'group',
+        position: { x: 200 + Math.random() * 120, y: 60 + Math.random() * 80 },
+        width: 620, height: 210,
+        data: { label: 'Mechanism', moveContents: true },
+        selectable: true, draggable: true, zIndex: -1 },
+      ...ns,
+    ]);
+    setSelected(id);
+  };
+
+  const renameGroup = (id: string, label: string) =>
+    setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, label } } : n)));
 
   const renamePlotter = (id: string, title: string) =>
     setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, title } } : n)));
@@ -473,6 +597,13 @@ export default function App() {
             </button>
           ))}
 
+          <h2 className="railhead">Layout</h2>
+          <button className="palette-item"
+            style={{ ['--acc' as string]: 'var(--ink-3)' }}
+            onClick={addGroup}>
+            Mechanism box
+          </button>
+
           <h2 className="railhead">Output</h2>
           <button className="palette-item"
             style={{ ['--acc' as string]: TYPE_COLOR.signal }}
@@ -509,7 +640,7 @@ export default function App() {
           <div className="canvas-wrap">
             <ReactFlow
               nodes={nodesForCanvas} edges={edges}
-              onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
+              onNodesChange={handleNodesChange} onEdgesChange={onEdgesChange}
               onConnect={onConnect} isValidConnection={isValidConnection}
               nodeTypes={nodeTypes}
               edgeTypes={edgeTypes}
@@ -564,7 +695,42 @@ export default function App() {
           <h2 className="railhead">
             {selectedBlock ? `${selectedBlock.kind} · ${selectedBlock.id}` : 'Inspector'}
           </h2>
-          {selected && plotterIds.has(selected) ? (
+          {selected && groupNodes.some((g) => g.id === selected) ? (
+            <div className="field">
+              <label>Mechanism name</label>
+              <input
+                type="text"
+                value={((groupNodes.find((g) => g.id === selected)?.data as Record<string, unknown>)?.label as string) ?? ''}
+                onChange={(ev) => renameGroup(selected, ev.target.value)}
+              />
+              <div className="hint">
+                Blocks whose centre sits inside the box belong to it. A box has
+                to hold exactly one complete chain — a motor, its gears, and the
+                solid it drives. Drag its edges to resize.
+              </div>
+              <div className="hint" style={{ marginTop: 6 }}>
+                Holding <b>{groups.find((g) => g.id === selected)?.memberIds.length ?? 0}</b> blocks.
+              </div>
+              <label style={{ marginTop: 10, display: 'block' }}>
+                <input
+                  type="checkbox"
+                  style={{ width: 'auto', marginRight: 6 }}
+                  checked={((groupNodes.find((g) => g.id === selected)?.data as Record<string, unknown>)?.moveContents) !== false}
+                  onChange={(ev) => setNodes((ns) => ns.map((n) =>
+                    (n.id === selected ? { ...n, data: { ...n.data, moveContents: ev.target.checked } } : n)))}
+                />
+                Move blocks with the box
+              </label>
+              <div className="hint">
+                On by default. Turn it off to reposition or resize the box
+                without disturbing what is inside it.
+              </div>
+              <button className="btn" style={{ width: '100%', marginTop: 10 }}
+                onClick={removeSelected}>
+                Remove box
+              </button>
+            </div>
+          ) : selected && plotterIds.has(selected) ? (
             <div className="field">
               <label>Plotter name</label>
               <input

@@ -14,6 +14,7 @@ import {
   ControllerBlock, LqrBlock, CONTROL_KINDS, Edge,
 } from './blocks';
 import { MotorConstants, getMotor } from './motors';
+import { scaleFromBase } from './units';
 
 export const G_ACCEL = 9.80665;
 
@@ -47,8 +48,14 @@ export interface Mechanism {
   friction: number;     // N-m at the output shaft
   theta0: number;       // initial output-shaft angle, rad
 
-  /** true when the terminal solid should be displayed in metres, not degrees. */
+  /** true when the terminal solid travels rather than rotates. */
   linearDisplay: boolean;
+  /** Multiply shaft radians by this to get the position channel's display unit. */
+  posScale: number;
+  /** Multiply shaft rad/s by this to get the velocity channel's display unit. */
+  velScale: number;
+  positionUnit: string;
+  velocityUnit: string;
 
   /** Gravity torque at the output shaft as a function of shaft angle. */
   gravityTorque: (theta: number) => number;
@@ -228,24 +235,30 @@ function resolveMechanism(
         lqr.id,
       );
     }
-    const posScale = solid.gravityMode === 'constant' ? radius! : (180 / Math.PI);
+    const lqrPosScale = (solid.gravityMode === 'constant' ? radius! : 1)
+      * scaleFromBase(solid.positionUnit ?? (solid.gravityMode === 'constant' ? 'm' : 'deg'));
     const a = (n * motor.Kt * ratio * ratio * efficiency) / (motor.Kv * motor.R * jEffOutput);
-    const b = ((n * motor.Kt * ratio * efficiency * battery.vOc) / (motor.R * jEffOutput)) * posScale;
+    const b = ((n * motor.Kt * ratio * efficiency * battery.vOc) / (motor.R * jEffOutput)) * lqrPosScale;
     const { k1, k2 } = solveLqrGains(a, b, lqr.qPos, lqr.qVel, lqr.r);
     lqrGains = { k1, k2, a, b };
   }
 
   const linearDisplay = solid.gravityMode === 'constant';
-  // initialPosition is given in DISPLAY units -- metres for linear chains,
-  // degrees for rotational -- matching how results are plotted.
-  const theta0 = linearDisplay
-    ? solid.initialPosition / radius!
-    : (solid.initialPosition * Math.PI) / 180;
+  const positionUnit = solid.positionUnit ?? (linearDisplay ? 'm' : 'deg');
+  const velocityUnit = solid.velocityUnit ?? (linearDisplay ? 'm/s' : 'deg/s');
+  // A drum turns shaft radians into metres first, then the unit scale takes
+  // metres to whatever the user wants to read. Rotational chains skip the
+  // radius step entirely.
+  const posScale = (linearDisplay ? radius! : 1) * scaleFromBase(positionUnit);
+  const velScale = (linearDisplay ? radius! : 1) * scaleFromBase(velocityUnit);
+  // initialPosition is given in the solid's own display unit.
+  const theta0 = solid.initialPosition / posScale;
 
   return {
     motorBlock, motor, gears, solid,
     ratio, efficiency, radius, inertiaSolid, jEffOutput,
     friction: solid.friction, theta0, linearDisplay, gravityTorque,
+    posScale, velScale, positionUnit, velocityUnit,
     controller, errorSource, lqrGains,
   };
 }
@@ -257,7 +270,16 @@ function resolveMechanism(
  * (a differential, a dual-motor merge) is a real feature this does not support
  * yet, and is rejected with a specific error rather than silently picking one.
  */
-export function compile(blocks: Block[], edges: Edge[]): System {
+/** A labelled box on the canvas that should hold exactly one mechanism chain. */
+export interface MechanismGroup {
+  id: string;
+  label: string;
+  memberIds: string[];
+}
+
+export function compile(
+  blocks: Block[], edges: Edge[], groups: MechanismGroup[] = [],
+): System {
   const byId = new Map(blocks.map((b) => [b.id, b]));
 
   const battery = blocks.find((b): b is BatteryBlock => b.kind === 'battery');
@@ -315,6 +337,20 @@ export function compile(blocks: Block[], edges: Edge[]): System {
     }
   }
 
+  // A controller that drives nothing is almost always a half-finished wire,
+  // and it fails in the most confusing way possible: the controller sits there
+  // looking connected, its motor quietly falls back to the manual duty field,
+  // and changing the target appears to do nothing at all.
+  for (const b of blocks) {
+    if (!CONTROL_KINDS.has(b.kind)) continue;
+    if (!drivenBy.has(b.id)) {
+      throw new CompileError(
+        `Controller "${b.id}" isn't wired to a motor. Connect its bar-shaped command output to a motor's command input, or the motor just runs at its own duty setting.`,
+        b.id,
+      );
+    }
+  }
+
   const claimed = new Map<string, string>(); // blockId -> which motor already uses it
   const mechanisms: Mechanism[] = [];
 
@@ -331,6 +367,66 @@ export function compile(blocks: Block[], edges: Edge[]): System {
       claimed.set(b.id, motorBlock.id);
     }
     mechanisms.push(mech);
+  }
+
+  /* --- mechanism boxes --------------------------------------------------
+     A box is a claim about structure: "this is one mechanism". Validating it
+     catches the mistake the box was drawn to prevent -- a chain that looks
+     grouped on the canvas but is actually wired through a block sitting
+     outside, or two mechanisms crammed into one label. */
+  if (groups.length > 0) {
+    const memberOf = new Map<string, string>();
+    const labelOf = new Map(groups.map((g) => [g.id, g.label]));
+    for (const g of groups) {
+      for (const id of g.memberIds) memberOf.set(id, g.id);
+    }
+
+    // The battery feeds every mechanism, so putting it inside one box would
+    // imply it belongs to that mechanism alone.
+    if (memberOf.has(battery.id)) {
+      const g = memberOf.get(battery.id)!;
+      throw new CompileError(
+        `The battery is inside "${labelOf.get(g)}". It powers every mechanism, so keep it outside the boxes.`,
+        battery.id,
+      );
+    }
+
+    for (const g of groups) {
+      const motorsInside = motorBlocks.filter((m) => g.memberIds.includes(m.id));
+      if (motorsInside.length === 0) {
+        throw new CompileError(
+          `Mechanism "${g.label}" has no motor in it. A mechanism box needs one complete chain: a motor, its gears, and the solid it drives.`,
+          g.id,
+        );
+      }
+      if (motorsInside.length > 1) {
+        throw new CompileError(
+          `Mechanism "${g.label}" holds ${motorsInside.length} motors (${motorsInside.map((m) => m.id).join(', ')}). One box is one mechanism — give each its own.`,
+          g.id,
+        );
+      }
+    }
+
+    for (const mech of mechanisms) {
+      const chain = [mech.motorBlock.id, ...mech.gears.map((x) => x.id), mech.solid.id];
+      const home = memberOf.get(mech.motorBlock.id);
+      if (home === undefined) continue; // ungrouped chains are fine
+      const strays = chain.filter((id) => memberOf.get(id) !== home);
+      if (strays.length > 0) {
+        throw new CompileError(
+          `Mechanism "${labelOf.get(home)}" is incomplete — ${strays.join(', ')} ${strays.length === 1 ? 'is' : 'are'} outside the box but part of the same chain. Drag ${strays.length === 1 ? 'it' : 'them'} in, or resize the box.`,
+          strays[0],
+        );
+      }
+      // A controller driving this chain belongs with it, if it is boxed at all.
+      const ctrl = mech.controller;
+      if (ctrl && memberOf.has(ctrl.id) && memberOf.get(ctrl.id) !== home) {
+        throw new CompileError(
+          `Controller "${ctrl.id}" drives "${mech.motorBlock.id}" but sits in a different mechanism box.`,
+          ctrl.id,
+        );
+      }
+    }
   }
 
   return { battery, mechanisms };
