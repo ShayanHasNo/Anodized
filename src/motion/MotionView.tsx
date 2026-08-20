@@ -1,5 +1,8 @@
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from 'react';
-import { Archetype, ArmPose, ElevatorPose, FlywheelPose } from './archetypes';
+import {
+  Archetype, ArmPose, ElevatorPose, FlywheelPose,
+  ArmWithChildPose, ElevatorWithChildPose, type ChildPose,
+} from './archetypes';
 
 export interface MotionMech {
   id: string;
@@ -18,6 +21,10 @@ export interface MotionMech {
   velocitySetpoint: number | null;
   posMin: number;
   posMax: number;
+  /** Solid id this one is joint-mounted on, or null if it stands alone. */
+  parentId: string | null;
+  /** True when a revolute joint carries the parent's orientation into this one. */
+  inheritsParentAngle: boolean;
 }
 
 const SPEEDS = [0.1, 0.25, 0.5, 1, 2];
@@ -76,6 +83,51 @@ export function MotionView({
 
   const i = Math.min(index, Math.max(0, steps - 1));
 
+  /* Group jointed mechanisms so a child is drawn inside its parent's card
+     rather than floating in one of its own. This has to walk the WHOLE chain,
+     not just one level -- a three-part mechanism (arm, wrist, gripper) needs
+     the gripper embedded inside the wrist, which is itself embedded inside
+     the arm. Marking only direct children silently drops anything past the
+     first joint from the display entirely, which is exactly the bug this
+     replaces: earlier, a chain any deeper than two links lost its last
+     mechanism from the Motion tab with no error, since it was flagged as
+     "embedded" by the flat pass but nothing ever actually drew it. */
+  const byId = new Map(mechs.map((m) => [m.id, m]));
+  const childrenOf = new Map<string, MotionMech[]>();
+  for (const m of mechs) {
+    if (m.parentId && byId.has(m.parentId)) {
+      const list = childrenOf.get(m.parentId) ?? [];
+      list.push(m);
+      childrenOf.set(m.parentId, list);
+    }
+  }
+  // Only the FIRST child at any given tip is embedded -- a second child on
+  // the same mount has no sensible place to sit inside the drawing, so it (and
+  // whatever chains off IT) keeps its own separate card instead.
+  const embedded = new Set<string>();
+  const markEmbedded = (id: string) => {
+    const first = childrenOf.get(id)?.[0];
+    if (first) { embedded.add(first.id); markEmbedded(first.id); }
+  };
+  for (const m of mechs) markEmbedded(m.id);
+  const roots = mechs.filter((m) => !embedded.has(m.id));
+
+  /** Recursively builds the nested pose chain starting at (and including) m. */
+  const buildChain = (m: MotionMech): ChildPose => ({
+    archetype: m.archetype,
+    value: (m.position[i] ?? 0) * m.toBase,
+    inheritsAngle: m.inheritsParentAngle,
+    travelMin: m.posMin,
+    travelMax: m.posMax,
+    child: childrenOf.get(m.id)?.[0] ? buildChain(childrenOf.get(m.id)![0]) : undefined,
+  });
+
+  /** Flattened labels of an embedded chain, for the card title. */
+  const chainLabels = (m: MotionMech): string[] => {
+    const next = childrenOf.get(m.id)?.[0];
+    return next ? [m.label, ...chainLabels(next)] : [m.label];
+  };
+
   if (mechs.length === 0) {
     return (
       <div className="empty" style={{ padding: 40, textAlign: 'center' }}>
@@ -116,22 +168,38 @@ export function MotionView({
       </div>
 
       <div className="motion-grid">
-        {mechs.map((m) => {
+        {roots.map((m) => {
+          const firstChild = childrenOf.get(m.id)?.[0];
           const pos = m.position[i] ?? 0;
           const vel = m.velocity[i] ?? 0;
           const base = pos * m.toBase;
+
+          const childPose: ChildPose | null = firstChild ? buildChain(firstChild) : null;
+          const labels = firstChild ? chainLabels(m) : [m.label];
+
           return (
             <section className="motion-card" key={m.id}>
               <div className="motion-head">
-                <h3 className="graphcard-title">{m.label}</h3>
-                <span className="node-id">{m.archetype}</span>
+                <h3 className="graphcard-title">{labels.join(' + ')}</h3>
+                <span className="node-id">
+                  {labels.length > 1 ? `${labels.length}-link chain` : m.archetype}
+                </span>
               </div>
               <div className="motion-stage">
-                {m.archetype === 'arm' && (
+                {childPose && m.archetype === 'arm' && (
+                  <ArmWithChildPose angle={base}
+                    setpoint={m.setpoint === null ? null : m.setpoint * m.toBase}
+                    child={childPose} />
+                )}
+                {childPose && m.archetype === 'elevator' && (
+                  <ElevatorWithChildPose position={pos} setpoint={m.setpoint}
+                    min={m.posMin} max={m.posMax} child={childPose} />
+                )}
+                {!childPose && m.archetype === 'arm' && (
                   <ArmPose angle={base}
                     setpoint={m.setpoint === null ? null : m.setpoint * m.toBase} />
                 )}
-                {m.archetype === 'elevator' && (
+                {!childPose && m.archetype === 'elevator' && (
                   <ElevatorPose position={pos} setpoint={m.setpoint}
                     min={m.posMin} max={m.posMax} />
                 )}
@@ -150,6 +218,25 @@ export function MotionView({
                   </span>
                 )}
               </div>
+              {(() => {
+                // One readout row per embedded link beyond the root -- a
+                // three-part chain gets a wrist row AND a gripper row, not
+                // just the first.
+                const rows: MotionMech[] = [];
+                let cur = firstChild;
+                while (cur) { rows.push(cur); cur = childrenOf.get(cur.id)?.[0]; }
+                return rows.map((c) => (
+                  <div className="motion-readout" style={{ marginTop: 4 }} key={c.id}>
+                    <span className="stat" style={{ color: 'var(--ink-3)' }}>{c.label}</span>
+                    <span className="stat">
+                      pos <b className="num">{fmt(c.position[i] ?? 0)}</b> {c.positionUnit}
+                    </span>
+                    <span className="stat">
+                      vel <b className="num">{fmt(c.velocity[i] ?? 0)}</b> {c.velocityUnit}
+                    </span>
+                  </div>
+                ));
+              })()}
             </section>
           );
         })}

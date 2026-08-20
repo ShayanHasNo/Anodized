@@ -61,6 +61,8 @@ export interface MechanismResult {
   steadyStateError: number | null;
   /** How far past the setpoint the mechanism travelled, same units. */
   overshoot: number | null;
+  /** The solid id this one is joint-mounted on, or null if it stands alone. */
+  parentSolidId: string | null;
 }
 
 export interface SimResult {
@@ -152,6 +154,32 @@ export function createRun(sys: System, opts: RunOptions): Run {
       startMeas: mech.theta0 * posScale, peakCurrent: 0, timeToTarget: null,
     };
   });
+
+  /* For a revolute joint's child, gravity depends on the WHOLE ancestor
+     chain's angle, not just the immediate parent -- a gripper on a wrist on
+     an arm needs arm.theta + wrist.theta, because its true world orientation
+     includes both. This is live state, looked up here rather than folded
+     into a closure at compile time, since it changes every step.
+
+     Only a ROTATING ancestor contributes. An elevator's theta is its drum's
+     shaft angle, which climbs continuously as the carriage rises and says
+     nothing about orientation -- an arm mounted on an elevator carriage
+     stays level as it goes up, so that link's own contribution is zero, but
+     the walk continues past it in case there's a rotating ancestor above. */
+  const branchBySolidId = new Map(branches.map((br) => [br.mech.solid.id, br]));
+  const angleOffsetFor = (mech: Mechanism): number => {
+    let total = 0;
+    let cur: Mechanism | undefined = mech;
+    const seen = new Set<string>([mech.solid.id]);
+    while (cur?.parentAngleSource) {
+      const parent = branchBySolidId.get(cur.parentAngleSource);
+      if (!parent || seen.has(parent.mech.solid.id)) break; // guards a cycle that somehow slipped past compile()
+      seen.add(parent.mech.solid.id);
+      if (!parent.mech.linearDisplay) total += parent.theta;
+      cur = parent.mech;
+    }
+    return total;
+  };
 
   // dt is chosen against the STIFFEST mechanism -- the one with the shortest
   // time constant -- since every branch integrates in lockstep.
@@ -246,7 +274,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
         lqrVelErr = lqr.targetVel - velMeas;
 
         if (lqr.gravityFeedforward) {
-          const tauGrav = mech.gravityTorque(br.theta);
+          const tauGrav = mech.gravityTorque(br.theta + angleOffsetFor(mech));
           const holdCurrent = tauGrav / (br.n * br.Kt * br.G * br.eta);
           lqrFF = (holdCurrent * br.R) / vOc;
         }
@@ -300,7 +328,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
 
       const tauMotor = br.Kt * iTotal;
       const appliedVoltage = o.D * busVoltage;
-      const tauGrav = mech.gravityTorque(br.theta);
+      const tauGrav = mech.gravityTorque(br.theta + angleOffsetFor(mech));
 
       // Efficiency always opposes motion: eats motor torque while driving,
       // resists the gravity term while the load is overhauling the motor.
@@ -425,6 +453,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
             ? Math.max(0, br.measMax - targetForOvershoot)
             : Math.max(0, targetForOvershoot - br.measMin))
         : null,
+      parentSolidId: mech.mountedOn,
     };
   });
 

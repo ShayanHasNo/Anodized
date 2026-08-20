@@ -179,6 +179,11 @@ export function Inspector({
             <Num label="Centre of gravity (m)" value={block.cgRadius ?? 0.4} step={0.01} min={0}
               onChange={(v) => set('cgRadius', v)} hint="Pivot to centre of mass" />
           )}
+          {block.gravityMode !== 'constant' && (
+            <Num label="Tip radius (m)" value={block.tipRadius ?? (block.cgRadius ?? 0.4) * 2} step={0.01} min={0}
+              onChange={(v) => set('tipRadius', v)}
+              hint="Pivot to the mount point — only matters if something is jointed onto this solid's tip" />
+          )}
           <Num label="Friction (N·m)" value={block.friction} step={0.1} min={0}
             onChange={(v) => set('friction', v)} hint="Coulomb friction at the output shaft" />
 
@@ -379,6 +384,29 @@ export function Inspector({
             The plant model (motor, ratio, effective inertia) is read directly
             from the attached chain. Gains are the closed-form solution of the
             continuous Riccati equation — shown on the block once it compiles.
+          </div>
+        </>
+      )}
+
+      {block.kind === 'joint' && (
+        <>
+          <div className="field">
+            <label>Joint type</label>
+            <select value={block.jointType} onChange={(e) => set('jointType', e.target.value as never)}>
+              <option value="revolute">Revolute (pivots)</option>
+              <option value="prismatic">Prismatic (slides)</option>
+            </select>
+            <div className="hint">
+              {block.jointType === 'revolute'
+                ? 'Connect a solid\u2019s tip to this joint\u2019s parent input, and this joint\u2019s child output to an arm or flywheel solid\u2019s mount input.'
+                : 'Connect a solid\u2019s tip to this joint\u2019s parent input, and this joint\u2019s child output to an elevator solid\u2019s mount input.'}
+            </div>
+          </div>
+          <div className="hint" style={{ marginBottom: 11 }}>
+            The child keeps its own motor, gearbox, and solid — a joint only
+            declares what it is attached to and what kind of attachment that
+            is. This version validates the wiring; it does not yet couple the
+            physics (gravity and reflected mass) between parent and child.
           </div>
         </>
       )}

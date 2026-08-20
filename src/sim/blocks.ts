@@ -18,7 +18,14 @@
  * inside every timestep, between reading state and computing torque.
  */
 
-export type PortType = 'rotational' | 'linear' | 'electrical' | 'signal' | 'control';
+/*
+ * A sixth type: mount. Unlike the other five, it carries neither power nor
+ * measurement -- it's a structural claim ("this solid is attached here"),
+ * which is why it gets a visually distinct treatment: a large gray square,
+ * not part of the warm/cool palette the physical types use. Gray reads as
+ * "structure," the same way it does on the mechanism box border.
+ */
+export type PortType = 'rotational' | 'linear' | 'electrical' | 'signal' | 'control' | 'mount';
 
 export const PORT_SHAPE: Record<PortType, string> = {
   rotational: 'circle',
@@ -26,11 +33,13 @@ export const PORT_SHAPE: Record<PortType, string> = {
   electrical: 'triangle',
   signal: 'hexagon',
   control: 'bar',
+  mount: 'bigsquare',
 };
 
 export const PORT_UNITS: Record<PortType, string> = {
   rotational: 'N-m, rad/s',
   linear: 'N, m/s',
+  mount: 'attachment reference',
   electrical: 'V, A',
   signal: 'varies by channel',
   control: 'duty cycle, -1..1',
@@ -99,6 +108,14 @@ export interface SolidBlock {
   inertia?: number;
   /** Distance from pivot to centre of gravity, m. Required for 'angleDependent'. */
   cgRadius?: number;
+  /**
+   * Distance from pivot to this solid's tip (its mount point), m. Only
+   * required when a joint actually mounts something here -- an ordinary
+   * unjointed solid never needs it. Irrelevant for 'constant' (elevator)
+   * solids, which reflect a mounted child's mass through their own drum
+   * radius instead, the same way they reflect their own.
+   */
+  tipRadius?: number;
   /** Coulomb friction torque at the output shaft, N-m. */
   friction: number;
   /**
@@ -194,8 +211,31 @@ export interface LqrBlock {
 /** Blocks that command the physics rather than being part of it. */
 export const CONTROL_KINDS: ReadonlySet<string> = new Set(['pid', 'bangbang', 'lqr']);
 
+export type JointType = 'revolute' | 'prismatic';
+
+/**
+ * Connects a parent solid's tip to a child solid's mount, forming a
+ * multi-joint chain (an arm carrying a wrist). Carries no physics of its own
+ * -- the child has its own independent motor, gear, and solid, exactly like
+ * any other mechanism. The joint is purely a structural claim: WHICH solid
+ * this one is attached to, and what kind of attachment that is.
+ *
+ * jointType constrains what the CHILD can physically be:
+ *   revolute  -- the child pivots, so it must be a rotating solid
+ *                (gravityMode 'angleDependent' or 'none': an arm or flywheel)
+ *   prismatic -- the child slides, so it must be a linear solid
+ *                (gravityMode 'constant': an elevator)
+ * The parent's own type is unconstrained -- an elevator can carry a pivoting
+ * arm, and an arm can carry a telescoping slide, both are real mechanisms.
+ */
+export interface JointBlock {
+  kind: 'joint';
+  id: string;
+  jointType: JointType;
+}
+
 export type Block =
-  | BatteryBlock | MotorBlock | GearBlock | SolidBlock | ControllerBlock;
+  | BatteryBlock | MotorBlock | GearBlock | SolidBlock | ControllerBlock | JointBlock;
 
 // --- Signal channels --------------------------------------------------------
 
@@ -268,6 +308,8 @@ export function channelsFor(block: Block): Channel[] {
         { key: p('gravityTorque'), label: 'Gravity torque', unit: 'N-m', family: 'torque' },
       ];
     }
+    case 'joint':
+      return [];
   }
 }
 
@@ -326,7 +368,18 @@ export function portsFor(block: Block): Port[] {
     case 'solid':
       return [
         { id: 'in', type: block.gravityMode === 'constant' ? 'linear' : 'rotational', direction: 'in' },
+        // Every solid can be a joint's child (mount, in) or a joint's parent
+        // (tip, out), regardless of configuration -- unlike the mechanical
+        // ports, which vary port TYPE by flavor, these are uniform because
+        // a joint's own type is what carries the compatibility constraint.
+        { id: 'mount', type: 'mount', direction: 'in' },
+        { id: 'tip', type: 'mount', direction: 'out' },
         sig,
+      ];
+    case 'joint':
+      return [
+        { id: 'parent', type: 'mount', direction: 'in' },
+        { id: 'child', type: 'mount', direction: 'out' },
       ];
     case 'pid':
     case 'bangbang':

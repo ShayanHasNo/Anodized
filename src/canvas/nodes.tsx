@@ -8,6 +8,7 @@ export const TYPE_COLOR: Record<PortType, string> = {
   electrical: 'var(--electrical)',
   signal: 'var(--signal)',
   control: 'var(--control)',
+  mount: 'var(--ink-3)',
 };
 
 const SHAPE_CLASS: Record<PortType, string> = {
@@ -16,6 +17,7 @@ const SHAPE_CLASS: Record<PortType, string> = {
   electrical: 'electrical',
   signal: 'hexagon',
   control: 'bar',
+  mount: 'mount',
 };
 
 export const KIND_ACCENT: Record<string, string> = {
@@ -27,6 +29,7 @@ export const KIND_ACCENT: Record<string, string> = {
   pid: 'var(--control)',
   bangbang: 'var(--control)',
   lqr: 'var(--control)',
+  joint: 'var(--ink-3)',
 };
 
 function Port({
@@ -142,7 +145,26 @@ export function SolidNode({ data, id, selected }: NodeProps) {
       sub={<>{GRAVITY_LABEL[b.gravityMode]}<br />
         {linear ? 'J from drum radius' : `J = ${(b.inertia ?? 0).toFixed(3)} kg·m²`}</>}>
       <Port id="in" type={linear ? 'linear' : 'rotational'} direction="in" position={Position.Left} offset="60%" />
+      <span className="handle-tag" style={{ top: -17, left: 76 }}>mount</span>
+      <Port id="mount" type="mount" direction="in" position={Position.Top} offset="50%" />
+      <span className="handle-tag" style={{ top: '58%', left: 178 }}>tip</span>
+      <Port id="tip" type="mount" direction="out" position={Position.Right} offset="60%" />
       <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
+    </Shell>
+  );
+}
+
+export function JointNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'joint' }>;
+  const hasError = (data as Data).hasError;
+  const label = b.jointType === 'revolute' ? 'Revolute' : 'Prismatic';
+  const needs = b.jointType === 'revolute' ? 'arm or flywheel child' : 'elevator child';
+  return (
+    <Shell kind="joint" id={id} selected={selected} hasError={hasError}
+      title={label}
+      sub={<>parent → child<br />needs a {needs}</>}>
+      <Port id="parent" type="mount" direction="in" position={Position.Left} offset="50%" />
+      <Port id="child" type="mount" direction="out" position={Position.Right} offset="50%" />
     </Shell>
   );
 }
@@ -252,5 +274,6 @@ export const nodeTypes = {
   pid: PidNode,
   bangbang: BangBangNode,
   lqr: LqrNode,
+  joint: JointNode,
   group: GroupNode,
 };

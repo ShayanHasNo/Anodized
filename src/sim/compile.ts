@@ -11,7 +11,7 @@
 
 import {
   Block, BatteryBlock, MotorBlock, GearBlock, SolidBlock,
-  ControllerBlock, LqrBlock, CONTROL_KINDS, Edge,
+  ControllerBlock, LqrBlock, JointBlock, CONTROL_KINDS, Edge,
 } from './blocks';
 import { MotorConstants, getMotor } from './motors';
 import { scaleFromBase } from './units';
@@ -43,6 +43,8 @@ export interface Mechanism {
   efficiency: number;   // eta, cumulative
   radius: number | null; // drum radius, m -- null for pure rotational chains
 
+  // Mutable: a joint coupling pass adjusts these after every mechanism is
+  // independently resolved, to reflect a mounted child's mass onto its parent.
   inertiaSolid: number; // kg-m^2 at the output shaft
   jEffOutput: number;   // inertiaSolid + rotor inertia reflected through G^2
   friction: number;     // N-m at the output shaft
@@ -57,8 +59,27 @@ export interface Mechanism {
   positionUnit: string;
   velocityUnit: string;
 
-  /** Gravity torque at the output shaft as a function of shaft angle. */
+  /**
+   * Gravity torque at the output shaft as a function of shaft angle. Mutable:
+   * a joint coupling pass can replace this with a version that also carries a
+   * mounted child's weight at the tip.
+   */
   gravityTorque: (theta: number) => number;
+
+  /**
+   * The parent solid's id, if this mechanism is a revolute joint's child. The
+   * solver adds that parent's LIVE shaft angle before evaluating gravityTorque
+   * every step -- a wrist's weight depends on the arm's angle right now, not
+   * at compile time, so this can't be folded into the closure above.
+   */
+  parentAngleSource: string | null;
+  /**
+   * The parent solid's id for ANY joint type, revolute or prismatic -- purely
+   * structural, used to draw the mechanism attached to its parent rather than
+   * floating separately. Distinct from parentAngleSource because a prismatic
+   * child is still visually mounted even though its gravity isn't coupled.
+   */
+  mountedOn: string | null;
 
   /** Controller driving the motor's command port, if one is wired up. */
   controller: ControllerBlock | null;
@@ -67,7 +88,8 @@ export interface Mechanism {
   /**
    * Precomputed LQR gains, if the controller is an LQR block. The plant is
    * linear and time-invariant, so the gains are solved once here rather than
-   * every timestep.
+   * every timestep. Mutable for the same reason as inertiaSolid: a mounted
+   * child changes jEffOutput, which changes the gain solve.
    */
   lqrGains: { k1: number; k2: number; a: number; b: number } | null;
 }
@@ -259,6 +281,7 @@ function resolveMechanism(
     ratio, efficiency, radius, inertiaSolid, jEffOutput,
     friction: solid.friction, theta0, linearDisplay, gravityTorque,
     posScale, velScale, positionUnit, velocityUnit,
+    parentAngleSource: null, mountedOn: null,
     controller, errorSource, lqrGains,
   };
 }
@@ -426,6 +449,175 @@ export function compile(
           ctrl.id,
         );
       }
+    }
+  }
+
+  /* --- joints -------------------------------------------------------------
+     Confirms a joint is fully wired, connects two distinct solids, does not
+     close a loop, and that the child's own type is physically legal for the
+     joint kind -- then couples the physics: gravity and reflected mass. See
+     the coupling pass below for exactly what is and isn't modeled. */
+  const joints = blocks.filter((b): b is JointBlock => b.kind === 'joint');
+  if (joints.length > 0) {
+    const solidsById = new Map(blocks.filter((b) => b.kind === 'solid').map((b) => [b.id, b as SolidBlock]));
+    const parentOfJoint = new Map<string, string>(); // joint id -> parent solid id
+    const childOfJoint = new Map<string, string>();  // joint id -> child solid id
+    const parentOfChild = new Map<string, string>(); // child solid id -> joint id that mounts it
+
+    for (const e of edges) {
+      if (e.to.portId === 'parent' && solidsById.has(e.from.blockId) && e.from.portId === 'tip') {
+        const existingParent = parentOfJoint.get(e.to.blockId);
+        if (existingParent && existingParent !== e.from.blockId) {
+          throw new CompileError(
+            `Joint "${e.to.blockId}" has two parents wired to it ("${existingParent}" and "${e.from.blockId}"). A joint can only have one.`,
+            e.to.blockId,
+          );
+        }
+        parentOfJoint.set(e.to.blockId, e.from.blockId);
+      }
+      if (e.from.portId === 'child' && solidsById.has(e.to.blockId) && e.to.portId === 'mount') {
+        childOfJoint.set(e.from.blockId, e.to.blockId);
+        // canConnect() already stops this on the canvas, but a hand-edited or
+        // loaded file can bypass it -- worth catching rather than silently
+        // letting the second joint win.
+        const existing = parentOfChild.get(e.to.blockId);
+        if (existing && existing !== e.from.blockId) {
+          throw new CompileError(
+            `"${e.to.blockId}" is mounted by both "${existing}" and "${e.from.blockId}". A solid can only have one parent joint.`,
+            e.to.blockId,
+          );
+        }
+        parentOfChild.set(e.to.blockId, e.from.blockId);
+      }
+    }
+
+    for (const j of joints) {
+      const parentId = parentOfJoint.get(j.id);
+      const childId = childOfJoint.get(j.id);
+      if (!parentId || !childId) {
+        throw new CompileError(
+          `Joint "${j.id}" isn't fully wired. Connect a solid's tip to this joint's parent input, and this joint's child output to another solid's mount input.`,
+          j.id,
+        );
+      }
+      if (parentId === childId) {
+        throw new CompileError(`Joint "${j.id}" connects "${parentId}" to itself.`, j.id);
+      }
+
+      const child = solidsById.get(childId)!;
+      if (j.jointType === 'revolute' && child.gravityMode === 'constant') {
+        throw new CompileError(
+          `Revolute joint "${j.id}" needs a rotating child (an arm or a flywheel), but "${childId}" is a linear mechanism (an elevator). Use a prismatic joint instead.`,
+          j.id,
+        );
+      }
+      if (j.jointType === 'prismatic' && child.gravityMode !== 'constant') {
+        throw new CompileError(
+          `Prismatic joint "${j.id}" needs a sliding child (an elevator), but "${childId}" is a rotating mechanism. Use a revolute joint instead.`,
+          j.id,
+        );
+      }
+    }
+
+    // A chain of joints must not loop back on itself: walk from every solid
+    // that is somebody's child, following parent links, and watch for a
+    // repeat. Same loop-detection shape used for the mechanical chain walk.
+    for (const startId of parentOfChild.keys()) {
+      const seen = new Set<string>([startId]);
+      let cur: string | undefined = startId;
+      while (true) {
+        const jointId: string | undefined = parentOfChild.get(cur!);
+        if (!jointId) break;
+        const next = parentOfJoint.get(jointId);
+        if (!next) break;
+        if (seen.has(next)) {
+          throw new CompileError(`Joint "${jointId}" closes a loop back to "${next}".`, jointId);
+        }
+        seen.add(next);
+        cur = next;
+      }
+    }
+
+    /* --- coupling ------------------------------------------------------
+       Two effects, both static except where noted:
+         1. GRAVITY: a revolute child's weight depends on the world, not on
+            its own local angle -- so its gravity torque needs the parent's
+            angle added in. That parent angle is LIVE state, so it can't be
+            folded into a closure here; the solver adds it every step.
+         2. MASS: the child's total mass loads the parent, at the parent's
+            tip. This IS static (the child's mass never changes), so it is
+            folded into the parent's inertia and gravity torque once, right
+            here, rather than every timestep.
+       Left out on purpose: reaction torque from the child's own acceleration
+       (still a rigid-attachment approximation), a prismatic child's gravity
+       depending on parent orientation (needs the slide's world direction,
+       deferred), and recursive reflection past one level (a grandchild's
+       mass does not propagate through its parent to the grandparent). */
+    const mechBySolidId = new Map(mechanisms.map((m) => [m.solid.id, m]));
+    const childrenOfParent = new Map<string, Mechanism[]>();
+
+    for (const j of joints) {
+      const parentId = parentOfJoint.get(j.id)!;
+      const childId = childOfJoint.get(j.id)!;
+      const parentMech = mechBySolidId.get(parentId);
+      const childMech = mechBySolidId.get(childId);
+      if (!parentMech) {
+        throw new CompileError(
+          `Joint "${j.id}" is mounted on "${parentId}", but "${parentId}" has no motor driving it. Every mechanism needs its own motor, gearbox, and solid.`,
+          parentId,
+        );
+      }
+      if (!childMech) {
+        throw new CompileError(
+          `Joint "${j.id}" mounts "${childId}", but "${childId}" has no motor driving it. Every mechanism needs its own motor, gearbox, and solid.`,
+          childId,
+        );
+      }
+      childMech.mountedOn = parentId;
+      if (j.jointType === 'revolute') childMech.parentAngleSource = parentId;
+      const list = childrenOfParent.get(parentId) ?? [];
+      list.push(childMech);
+      childrenOfParent.set(parentId, list);
+    }
+
+    const deriveLqrGains = (mech: Mechanism) => {
+      if (mech.controller?.kind !== 'lqr') return;
+      const lqr = mech.controller;
+      const n = mech.motorBlock.count;
+      const a = (n * mech.motor.Kt * mech.ratio * mech.ratio * mech.efficiency)
+        / (mech.motor.Kv * mech.motor.R * mech.jEffOutput);
+      const b = ((n * mech.motor.Kt * mech.ratio * mech.efficiency * battery.vOc)
+        / (mech.motor.R * mech.jEffOutput)) * mech.posScale;
+      const { k1, k2 } = solveLqrGains(a, b, lqr.qPos, lqr.qVel, lqr.r);
+      mech.lqrGains = { k1, k2, a, b };
+    };
+
+    for (const [parentId, children] of childrenOfParent) {
+      const parentMech = mechBySolidId.get(parentId)!;
+      const totalChildMass = children.reduce((sum, c) => sum + c.solid.mass, 0);
+      const oldGravityTorque = parentMech.gravityTorque;
+
+      if (parentMech.linearDisplay) {
+        const r = parentMech.radius!;
+        parentMech.inertiaSolid += totalChildMass * r * r;
+        const addedGravity = totalChildMass * G_ACCEL * r;
+        parentMech.gravityTorque = (theta) => oldGravityTorque(theta) + addedGravity;
+      } else {
+        const tipR = parentMech.solid.tipRadius;
+        if (!tipR || tipR <= 0) {
+          throw new CompileError(
+            `"${parentId}" needs a tip radius before something can be mounted on it — set it in the inspector.`,
+            parentId,
+          );
+        }
+        parentMech.inertiaSolid += totalChildMass * tipR * tipR;
+        const addedPeak = totalChildMass * G_ACCEL * tipR;
+        parentMech.gravityTorque = (theta) => oldGravityTorque(theta) + addedPeak * Math.cos(theta);
+      }
+
+      parentMech.jEffOutput = parentMech.inertiaSolid
+        + parentMech.motorBlock.count * parentMech.motor.spec.rotorInertia * parentMech.ratio * parentMech.ratio;
+      deriveLqrGains(parentMech);
     }
   }
 

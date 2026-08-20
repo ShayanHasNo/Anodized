@@ -82,6 +82,8 @@ function makeBlock(kind: Block['kind']): Block {
         kind, id: nextId('lqr'), qPos: 40, qVel: 4, r: 1,
         targetPos: 75, targetVel: 0, gravityFeedforward: true,
       };
+    case 'joint':
+      return { kind, id: nextId('joint'), jointType: 'revolute' };
   }
 }
 
@@ -509,11 +511,21 @@ export default function App() {
       }
       if (setpoint !== null) { lo = Math.min(lo, setpoint); hi = Math.max(hi, setpoint); }
 
+      // A revolute joint carries the parent's orientation into the child; a
+      // prismatic one only carries position. The solver draws exactly the same
+      // distinction, so the drawing and the physics agree by construction.
+      const parentMech = m.parentSolidId
+        ? result.mechanisms.find((x) => x.solidId === m.parentSolidId)
+        : undefined;
+      const inheritsParentAngle = !!parentMech && !parentMech.linearDisplay;
+
       return {
         id: m.solidId, label: m.solidId, archetype,
         position: pos, toBase, positionUnit: posUnit,
         velocity: vel, velocityUnit: velUnit,
         setpoint, velocitySetpoint, posMin: lo, posMax: hi,
+        parentId: m.parentSolidId,
+        inheritsParentAngle,
       } as MotionMech;
     }).filter((x): x is MotionMech => x !== null);
   }, [result, blockById]);
@@ -730,6 +742,7 @@ export default function App() {
             ['motor', 'Motor', 'electrical'],
             ['gear', 'Gear', 'rotational'],
             ['solid', 'Solid', 'rotational'],
+            ['joint', 'Joint', 'mount'],
           ] as const).map(([kind, label, type]) => (
             <button key={kind} className="palette-item"
               style={{ ['--acc' as string]: TYPE_COLOR[type] }}
