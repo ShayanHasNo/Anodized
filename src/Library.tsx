@@ -77,6 +77,39 @@ export function Library({ onClose }: { onClose: () => void }) {
           ))}
         </div>
 
+        <h3 className="railhead">Canvas shortcuts</h3>
+        <div className="lib-grid">
+          {[
+            ['Delete / Backspace', 'Removes every selected block and any wire touching it. Ignored while you\u2019re typing in a field.'],
+            ['Drag on empty canvas', 'Draws a selection box. Anything it touches gets selected.'],
+            ['Shift + click', 'Adds or removes a single block from the selection.'],
+            ['Middle-drag or right-drag', 'Pans the canvas, since plain dragging now draws a selection box.'],
+            ['Ctrl/Cmd + A', 'Selects everything.'],
+            ['Ctrl/Cmd + C, then V', 'Copies the selection and pastes it offset, with fresh ids.'],
+            ['Ctrl/Cmd + D', 'Duplicates the selection in one step.'],
+            ['Escape', 'Clears the selection.'],
+          ].map(([k, d]) => (
+            <div className="lib-row" key={k}>
+              <div>
+                <div className="lib-title">{k}</div>
+                <div className="lib-desc">{d}</div>
+              </div>
+            </div>
+          ))}
+          <div className="lib-row">
+            <div>
+              <div className="lib-title">What copying carries</div>
+              <div className="lib-desc">
+                Wires are copied only when both ends are inside the selection.
+                Copy a motor, gear, and solid together and the copy is a
+                working chain; copy just the gear and it arrives unwired,
+                rather than silently re-attaching to the original\u2019s motor and
+                giving one motor two chains.
+              </div>
+            </div>
+          </div>
+        </div>
+
         <h3 className="railhead">Joints — tip, mount, and tip radius</h3>
         <div className="lib-grid">
           {JOINT_DOCS.map((j) => (

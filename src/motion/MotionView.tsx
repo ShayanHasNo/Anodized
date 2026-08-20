@@ -1,7 +1,8 @@
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from 'react';
 import {
   Archetype, ArmPose, ElevatorPose, FlywheelPose,
-  ArmWithChildPose, ElevatorWithChildPose, type ChildPose,
+  ArmWithChildPose, ElevatorWithChildPose,
+  type ChildPose, type ElevatorStage,
 } from './archetypes';
 
 export interface MotionMech {
@@ -122,6 +123,42 @@ export function MotionView({
     child: childrenOf.get(m.id)?.[0] ? buildChain(childrenOf.get(m.id)![0]) : undefined,
   });
 
+  /**
+   * An unbroken run of elevators chained together is a CASCADE -- stages that
+   * ride on each other, so their heights add. Detected here rather than
+   * assumed, since an elevator carrying an arm is a different thing entirely
+   * and must not be drawn as a telescoping stack.
+   */
+  const cascadeStages = (m: MotionMech): ElevatorStage[] | null => {
+    if (m.archetype !== 'elevator') return null;
+    const stages: ElevatorStage[] = [];
+    let cur: MotionMech | undefined = m;
+    while (cur && cur.archetype === 'elevator') {
+      stages.push({
+        position: cur.position[i] ?? 0,
+        min: cur.posMin,
+        max: cur.posMax,
+        setpoint: cur.setpoint,
+      });
+      const next: MotionMech | undefined = childrenOf.get(cur.id)?.[0];
+      // Stop at the first non-elevator: that chain continues, but not as a
+      // cascade, so it belongs to the carrying renderer instead.
+      if (!next || next.archetype !== 'elevator') return stages.length ? stages : null;
+      cur = next;
+    }
+    return stages.length ? stages : null;
+  };
+
+  /** True when the whole embedded chain below m is elevators all the way down. */
+  const isPureCascade = (m: MotionMech): boolean => {
+    let cur: MotionMech | undefined = m;
+    while (cur) {
+      if (cur.archetype !== 'elevator') return false;
+      cur = childrenOf.get(cur.id)?.[0];
+    }
+    return true;
+  };
+
   /** Flattened labels of an embedded chain, for the card title. */
   const chainLabels = (m: MotionMech): string[] => {
     const next = childrenOf.get(m.id)?.[0];
@@ -177,31 +214,32 @@ export function MotionView({
           const childPose: ChildPose | null = firstChild ? buildChain(firstChild) : null;
           const labels = firstChild ? chainLabels(m) : [m.label];
 
+          const cascade = isPureCascade(m) ? cascadeStages(m) : null;
+
           return (
             <section className="motion-card" key={m.id}>
               <div className="motion-head">
                 <h3 className="graphcard-title">{labels.join(' + ')}</h3>
                 <span className="node-id">
-                  {labels.length > 1 ? `${labels.length}-link chain` : m.archetype}
+                  {cascade && cascade.length > 1
+                    ? `${cascade.length}-stage cascade`
+                    : labels.length > 1 ? `${labels.length}-link chain` : m.archetype}
                 </span>
               </div>
               <div className="motion-stage">
-                {childPose && m.archetype === 'arm' && (
+                {cascade && <ElevatorPose stages={cascade} />}
+                {!cascade && childPose && m.archetype === 'arm' && (
                   <ArmWithChildPose angle={base}
                     setpoint={m.setpoint === null ? null : m.setpoint * m.toBase}
                     child={childPose} />
                 )}
-                {childPose && m.archetype === 'elevator' && (
+                {!cascade && childPose && m.archetype === 'elevator' && (
                   <ElevatorWithChildPose position={pos} setpoint={m.setpoint}
                     min={m.posMin} max={m.posMax} child={childPose} />
                 )}
-                {!childPose && m.archetype === 'arm' && (
+                {!cascade && !childPose && m.archetype === 'arm' && (
                   <ArmPose angle={base}
                     setpoint={m.setpoint === null ? null : m.setpoint * m.toBase} />
-                )}
-                {!childPose && m.archetype === 'elevator' && (
-                  <ElevatorPose position={pos} setpoint={m.setpoint}
-                    min={m.posMin} max={m.posMax} />
                 )}
                 {m.archetype === 'flywheel' && <FlywheelPose angle={base} />}
               </div>

@@ -57,24 +57,84 @@ export function ArmPose({ angle, setpoint }: { angle: number; setpoint: number |
   );
 }
 
+/** One stage of an elevator, in its own display units. */
+export interface ElevatorStage {
+  position: number;
+  min: number;
+  max: number;
+  setpoint: number | null;
+}
+
 /**
- * Elevator: a carriage on a vertical rail. Travel is auto-fitted to the range
- * the run actually covers, so a 20 cm hop and a 2 m lift both fill the frame.
+ * Elevator, drawn from the SIDE: a thin vertical mast rather than a wide box,
+ * which is how an elevator actually looks on a robot and makes the travel the
+ * dominant visual rather than the carriage.
+ *
+ * Several stages chained by prismatic joints render as a cascade -- nested
+ * tubes, each riding on the one below and getting slightly narrower going up,
+ * the way a real telescoping elevator does. Because each stage rides the one
+ * below it, stage heights are CUMULATIVE: the top carriage sits at the sum of
+ * every stage's extension, which is exactly what a cascade buys you and what
+ * makes it worth drawing differently from a single stage.
  */
 export function ElevatorPose({
-  position, setpoint, min, max,
-}: { position: number; setpoint: number | null; min: number; max: number }) {
-  const top = 28, bot = 172;
-  const span = max - min;
-  const y = (v: number) => (span < 1e-9 ? (top + bot) / 2 : bot - ((v - min) / span) * (bot - top));
-  const cy = y(position);
+  stages,
+}: { stages: ElevatorStage[] }) {
+  const ground = 178, ceiling = 22;
+  const budget = ground - ceiling;
+
+  // Scale so the fully-extended cascade exactly fills the frame. Sum of the
+  // per-stage maxima, not the max of them, since they stack.
+  const totalMax = stages.reduce((s, st) => s + Math.max(0, st.max - st.min), 0);
+  const scale = totalMax < 1e-9 ? 0 : (budget * 0.92) / totalMax;
+
+  // Each stage's own extension, and how far the stages below have lifted it.
+  const ext = stages.map((st) => Math.max(0, st.position - st.min) * scale);
+  const liftBelow: number[] = [];
+  let running = 0;
+  for (const e of ext) { liftBelow.push(running); running += e; }
+
+  // Setpoint marker: the cascade's total commanded height, when every stage
+  // has one. A partial set would be misleading, so it's all or nothing.
+  const allHaveSetpoint = stages.every((st) => st.setpoint !== null);
+  const setpointY = allHaveSetpoint
+    ? ground - stages.reduce((s, st) => s + Math.max(0, (st.setpoint as number) - st.min) * scale, 0)
+    : null;
+
+  const railH = budget / Math.max(1, stages.length) * 1.15;
+
   return (
-    <svg viewBox={`0 0 ${BOX} ${BOX}`} width="100%" role="img" aria-label="Elevator position">
-      <rect x={96} y={top} width={8} height={bot - top} rx={3} fill={C.frame} opacity={0.35} />
-      {setpoint !== null && <Ghost d={`M60 ${y(setpoint)} L140 ${y(setpoint)}`} />}
-      <rect x={68} y={cy - 15} width={64} height={30} rx={5} fill={C.live} />
-      <rect x={68} y={cy - 15} width={64} height={30} rx={5} fill="none"
-        stroke={C.liveDark} strokeWidth={0.5} />
+    <svg viewBox={`0 0 ${BOX} ${BOX}`} width="100%" role="img"
+      aria-label={stages.length > 1 ? `Cascade elevator, ${stages.length} stages` : 'Elevator position'}>
+      {/* base plate -- gives the side view something to stand on */}
+      <rect x={64} y={ground} width={72} height={5} rx={2} fill={C.frame} opacity={0.55} />
+      {setpointY !== null && <Ghost d={`M56 ${setpointY} L144 ${setpointY}`} />}
+
+      {stages.map((_, i) => {
+        const halfW = Math.max(4, 11 - i * 2.2);
+        const bottom = ground - liftBelow[i];
+        const top = Math.max(ceiling - 6, bottom - railH);
+        return (
+          <g key={i}>
+            <rect x={100 - halfW} y={top} width={halfW * 2} height={bottom - top}
+              rx={3} fill={C.live} opacity={0.20 + i * 0.06} />
+            <rect x={100 - halfW} y={top} width={halfW * 2} height={bottom - top}
+              rx={3} fill="none" stroke={C.liveDark} strokeWidth={0.5} opacity={0.8} />
+          </g>
+        );
+      })}
+
+      {/* carriage rides the top of the last stage */}
+      {(() => {
+        const topOfStack = ground - running;
+        return (
+          <>
+            <rect x={84} y={topOfStack - 9} width={32} height={16} rx={4} fill={C.live} />
+            <rect x={84} y={topOfStack - 9} width={32} height={16} rx={4} fill="none"
+              stroke={C.liveDark} strokeWidth={0.5} />
+          </>
+        );
+      })()}
     </svg>
   );
 }
@@ -134,18 +194,23 @@ function ChildBody({ child, len }: { child: ChildPose; len: number }) {
 
   if (child.archetype === 'elevator') {
     const span = child.travelMax - child.travelMin;
-    const frac = span < 1e-9 ? 0.5 : (child.value - child.travelMin) / span;
-    const railLen = len * 1.5;
-    const y = railLen * (1 - frac);
-    const carHalf = len * 0.57;
+    const frac = span < 1e-9 ? 0 : (child.value - child.travelMin) / span;
+    const railLen = len * 1.6;
+    // Side view: a thin mast whose carriage rides up it, matching the
+    // standalone elevator rather than reading as a wide box.
+    const halfW = Math.max(2.5, len * 0.16);
+    const carHalf = Math.max(5, len * 0.34);
+    const carY = -railLen * frac;
     return (
       <>
-        <rect x={-3} y={-railLen} width={6} height={railLen} rx={2}
-          fill={C.frame} opacity={0.4} />
-        <rect x={-carHalf} y={y - railLen - 8} width={carHalf * 2} height={16} rx={4}
-          fill={C.live} opacity={0.85} />
+        <rect x={-halfW} y={-railLen} width={halfW * 2} height={railLen} rx={2}
+          fill={C.live} opacity={0.22} />
+        <rect x={-halfW} y={-railLen} width={halfW * 2} height={railLen} rx={2}
+          fill="none" stroke={C.liveDark} strokeWidth={0.5} opacity={0.7} />
+        <rect x={-carHalf} y={carY - 5} width={carHalf * 2} height={10} rx={3}
+          fill={C.live} opacity={0.9} />
         {child.child && (
-          <g transform={`translate(0 ${-railLen})`}>
+          <g transform={`translate(0 ${carY})`}>
             <circle cx={0} cy={0} r={cap * 0.8} fill={C.frame} />
             <ChildBody child={child.child} len={nextLen} />
           </g>
@@ -226,26 +291,34 @@ export function ArmWithChildPose({
   );
 }
 
-/** An elevator carrying a child on its carriage. */
+/** An elevator carrying a child on its carriage, drawn from the side. */
 export function ElevatorWithChildPose({
   position, setpoint, min, max, child,
 }: {
   position: number; setpoint: number | null; min: number; max: number; child: ChildPose;
 }) {
-  const top = 34, bot = 168;
+  const ground = 176, ceiling = 30;
   const span = max - min;
-  const y = (v: number) => (span < 1e-9 ? (top + bot) / 2 : bot - ((v - min) / span) * (bot - top));
+  const y = (v: number) => (span < 1e-9 ? (ground + ceiling) / 2
+    : ground - ((v - min) / span) * (ground - ceiling));
   const cy = y(position);
+  // The mast sits left of centre so the child has room to swing to the right
+  // without leaving the frame.
+  const mastX = 62, halfW = 7;
   return (
     <svg viewBox={`0 0 ${BOX} ${BOX}`} width="100%" role="img"
       aria-label="Elevator carrying a jointed child">
-      <rect x={56} y={top} width={8} height={bot - top} rx={3} fill={C.frame} opacity={0.35} />
-      {setpoint !== null && <Ghost d={`M34 ${y(setpoint)} L86 ${y(setpoint)}`} />}
-      <rect x={36} y={cy - 13} width={48} height={26} rx={5} fill={C.live} />
+      <rect x={mastX - 22} y={ground} width={44} height={5} rx={2} fill={C.frame} opacity={0.55} />
+      <rect x={mastX - halfW} y={ceiling} width={halfW * 2} height={ground - ceiling}
+        rx={3} fill={C.live} opacity={0.20} />
+      <rect x={mastX - halfW} y={ceiling} width={halfW * 2} height={ground - ceiling}
+        rx={3} fill="none" stroke={C.liveDark} strokeWidth={0.5} opacity={0.7} />
+      {setpoint !== null && <Ghost d={`M${mastX - 24} ${y(setpoint)} L${mastX + 24} ${y(setpoint)}`} />}
+      <rect x={mastX - 15} y={cy - 8} width={30} height={16} rx={4} fill={C.live} />
       {/* A carriage does not rotate, so the child never inherits an angle here
           -- matching the solver, which contributes no offset from a linear
           parent for exactly the same reason. */}
-      <g transform={`translate(94 ${cy})`}>
+      <g transform={`translate(${mastX + 18} ${cy})`}>
         <circle cx={0} cy={0} r={6} fill={C.frame} />
         <ChildBody child={child} len={24} />
       </g>

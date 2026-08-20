@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow, Background, Controls, BackgroundVariant,
   useNodesState, useEdgesState, addEdge,
+  SelectionMode,
   type Connection, type Node, type NodeChange, type Edge as RFEdge,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
@@ -47,6 +48,21 @@ const AXIS_GROUP: Record<string, string> = {
 const resolve = (v: string) =>
   v.startsWith('var(') ? getComputedStyle(document.documentElement)
     .getPropertyValue(v.slice(4, -1)).trim() : v;
+
+/*
+ * React Flow's <StoreUpdater> syncs several props (panOnDrag, defaultEdgeOptions,
+ * proOptions among them) into its internal store by reference-comparing them
+ * every render. An inline array or object literal is a NEW reference every
+ * time, which the store reads as "this changed," triggers its own setState,
+ * which re-renders this component, which recreates the literal -- an infinite
+ * loop that surfaces as "Maximum update depth exceeded" with no stack trace
+ * pointing at any code we wrote. Defining these once, outside the component,
+ * is the fix: same reference every render, so the store only updates when the
+ * VALUE genuinely changes (never, for any of these).
+ */
+const PAN_ON_DRAG = [1, 2];
+const PRO_OPTIONS = { hideAttribution: true };
+const DEFAULT_EDGE_OPTIONS = { type: 'removable', style: { strokeWidth: 1.6 } };
 
 let uid = 0;
 const nextId = (kind: string) => `${kind}${++uid}`;
@@ -143,6 +159,10 @@ export default function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState(start.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(start.edges);
   const [selected, setSelected] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  /* Clipboard lives in a ref, not state -- copying should never trigger a
+     re-render or a re-solve, and nothing on screen reflects its contents. */
+  const clipboard = useRef<{ nodes: Node[]; edges: RFEdge[] } | null>(null);
   const [result, setResult] = useState<SimResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [errorBlockId, setErrorBlockId] = useState<string | null>(null);
@@ -256,12 +276,126 @@ export default function App() {
   const updateBlock = (b: Block) =>
     setNodes((ns) => ns.map((n) => (n.id === b.id ? { ...n, data: { block: b } } : n)));
 
-  const removeSelected = () => {
-    if (!selected) return;
-    setNodes((ns) => ns.filter((n) => n.id !== selected));
-    setEdges((es) => es.filter((e) => e.source !== selected && e.target !== selected));
+  /** Removes every selected node, plus any edge touching one of them. */
+  const removeSelected = useCallback(() => {
+    const ids = new Set(selectedIds.length ? selectedIds : (selected ? [selected] : []));
+    if (ids.size === 0) return;
+    setNodes((ns) => ns.filter((n) => !ids.has(n.id)));
+    setEdges((es) => es.filter((e) => !ids.has(e.source) && !ids.has(e.target)));
     setSelected(null);
-  };
+    setSelectedIds([]);
+  }, [selectedIds, selected, setNodes, setEdges]);
+
+  /* --- clipboard ---------------------------------------------------------- */
+
+  /**
+   * Clones a set of nodes with fresh ids, rewiring any edge whose BOTH ends are
+   * inside the selection. Edges with only one end selected are dropped -- a
+   * copied gearbox shouldn't silently re-attach to the original's motor, since
+   * that would give one motor two chains and fail to compile.
+   */
+  const cloneNodes = useCallback((
+    source: Node[], sourceEdges: RFEdge[], offset: number,
+  ): { nodes: Node[]; edges: RFEdge[] } => {
+    const idMap = new Map<string, string>();
+    const cloned: Node[] = source.map((n) => {
+      const prefix = n.type === 'group' ? 'mech'
+        : n.type === 'plotter' ? 'plot'
+        : ((n.data as { block?: Block }).block?.kind ?? 'node');
+      const fresh = nextId(prefix === 'gear' ? 'gear' : prefix);
+      idMap.set(n.id, fresh);
+      // The block carries its own id, so it has to be rewritten too or the
+      // solver would see two blocks claiming the same identity.
+      const data = (n.data as { block?: Block }).block
+        ? { ...n.data, block: { ...(n.data as { block: Block }).block, id: fresh } }
+        : { ...n.data };
+      return {
+        ...n, id: fresh, data,
+        position: { x: n.position.x + offset, y: n.position.y + offset },
+        selected: true,
+      };
+    });
+    const clonedEdges: RFEdge[] = sourceEdges
+      .filter((e) => idMap.has(e.source) && idMap.has(e.target))
+      .map((e) => {
+        const s2 = idMap.get(e.source)!, t2 = idMap.get(e.target)!;
+        return {
+          ...e,
+          id: `${s2}:${e.sourceHandle}->${t2}:${e.targetHandle}`,
+          source: s2, target: t2,
+        };
+      });
+    return { nodes: cloned, edges: clonedEdges };
+  }, []);
+
+  const copySelected = useCallback(() => {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
+    clipboard.current = {
+      nodes: nodes.filter((n) => ids.has(n.id)),
+      edges: edges.filter((e) => ids.has(e.source) && ids.has(e.target)),
+    };
+  }, [selectedIds, nodes, edges]);
+
+  const pasteClipboard = useCallback(() => {
+    const clip = clipboard.current;
+    if (!clip || clip.nodes.length === 0) return;
+    const { nodes: newNodes, edges: newEdges } = cloneNodes(clip.nodes, clip.edges, 40);
+    setNodes((ns) => [...ns.map((n) => ({ ...n, selected: false })), ...newNodes]);
+    setEdges((es) => es.concat(newEdges));
+    setSelectedIds(newNodes.map((n) => n.id));
+    setSelected(newNodes[0]?.id ?? null);
+  }, [cloneNodes, setNodes, setEdges]);
+
+  const duplicateSelected = useCallback(() => {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
+    const src = nodes.filter((n) => ids.has(n.id));
+    const srcEdges = edges.filter((e) => ids.has(e.source) && ids.has(e.target));
+    const { nodes: newNodes, edges: newEdges } = cloneNodes(src, srcEdges, 40);
+    setNodes((ns) => [...ns.map((n) => ({ ...n, selected: false })), ...newNodes]);
+    setEdges((es) => es.concat(newEdges));
+    setSelectedIds(newNodes.map((n) => n.id));
+    setSelected(newNodes[0]?.id ?? null);
+  }, [selectedIds, nodes, edges, cloneNodes, setNodes, setEdges]);
+
+  /* Keyboard shortcuts. Deliberately inert while a text field or dropdown has
+     focus -- otherwise backspacing a typo out of the design-name box or a gain
+     field would delete the selected blocks instead, which is unrecoverable. */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      const typing = !!t && (
+        t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'
+        || t.isContentEditable
+      );
+      if (typing) return;
+      if (view !== 'canvas') return;
+
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod && (e.key === 'Delete' || e.key === 'Backspace')) {
+        if (selectedIds.length || selected) { e.preventDefault(); removeSelected(); }
+        return;
+      }
+      if (mod && e.key.toLowerCase() === 'c') { e.preventDefault(); copySelected(); return; }
+      if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteClipboard(); return; }
+      if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSelected(); return; }
+      if (mod && e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        setNodes((ns) => ns.map((n) => ({ ...n, selected: true })));
+        setSelectedIds(nodes.map((n) => n.id));
+        return;
+      }
+      if (e.key === 'Escape') {
+        setNodes((ns) => ns.map((n) => ({ ...n, selected: false })));
+        setSelectedIds([]);
+        setSelected(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [view, selectedIds, selected, removeSelected, copySelected, pasteClipboard,
+      duplicateSelected, nodes, setNodes]);
 
   /* --- run ---------------------------------------------------------------- */
 
@@ -814,9 +948,23 @@ export default function App() {
               onConnect={onConnect} isValidConnection={isValidConnection}
               nodeTypes={nodeTypes}
               edgeTypes={edgeTypes}
-              onSelectionChange={({ nodes: n }) => setSelected(n[0]?.id ?? null)}
-              fitView proOptions={{ hideAttribution: true }}
-              defaultEdgeOptions={{ type: 'removable', style: { strokeWidth: 1.6 } }}
+              onSelectionChange={({ nodes: n }) => {
+                setSelected(n[0]?.id ?? null);
+                setSelectedIds(n.map((x) => x.id));
+              }}
+              fitView proOptions={PRO_OPTIONS}
+              defaultEdgeOptions={DEFAULT_EDGE_OPTIONS}
+              /* Drag on empty canvas draws a selection box; hold space or the
+                 middle button to pan instead. Multi-select also works with
+                 shift-click. */
+              selectionOnDrag
+              panOnDrag={PAN_ON_DRAG}
+              selectionMode={SelectionMode.Partial}
+              multiSelectionKeyCode="Shift"
+              /* Our own keydown handler owns Delete/Backspace so it can ignore
+                 keystrokes aimed at text fields; React Flow's built-in version
+                 has no such guard. */
+              deleteKeyCode={null}
             >
               <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#333b41" />
               <Controls showInteractive={false} />
