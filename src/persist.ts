@@ -14,15 +14,21 @@ export interface SaveFile {
   app: 'anodized';
   savedAt: string;
   duration: number;
-  /** Action programs, opaque to persistence -- shape owned by ActionsView. */
+  /** Programs, opaque to persistence -- shape owned by ActionsView. */
   programs: unknown[];
+  /**
+   * Reusable actions that programs reference by id. Separate from programs
+   * because they are separate things: deleting a program must not take the
+   * actions it used with it, since other programs share them.
+   */
+  actions: unknown[];
   nodes: Node[];
   edges: RFEdge[];
 }
 
 export function serialize(
   nodes: Node[], edges: RFEdge[], duration: number, name: string,
-  programs: unknown[] = [],
+  programs: unknown[] = [], actions: unknown[] = [],
 ): string {
   const file: SaveFile = {
     version: SAVE_VERSION,
@@ -30,6 +36,7 @@ export function serialize(
     name: name.trim() || 'Untitled design',
     savedAt: new Date().toISOString(),
     programs,
+    actions,
     duration,
     // Strip React Flow's transient UI state -- selection, drag flags, and
     // measured sizes are re-derived on load and only bloat the file.
@@ -77,6 +84,10 @@ export function deserialize(text: string): SaveFile {
     savedAt: f.savedAt ?? '',
     duration: typeof f.duration === 'number' ? f.duration : 1.5,
     programs: Array.isArray(f.programs) ? f.programs : [],
+    /* Files saved before actions existed have none. Their programs are made
+       entirely of state and wait steps, which are still valid program steps,
+       so they load and run unchanged. */
+    actions: Array.isArray(f.actions) ? f.actions : [],
     nodes: f.nodes,
     edges: f.edges,
   };

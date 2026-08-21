@@ -253,7 +253,16 @@ export interface ChildPose {
   archetype: Archetype;
   /** Radians for a revolute child, metres of travel for a prismatic one. */
   value: number;
-  /** True when the parent's rotation carries the child's orientation too. */
+  /**
+   * True when the parent's rotation carries the child's orientation too --
+   * i.e. the parent is a rotating body, so the child's whole mounting frame
+   * turns with it.
+   *
+   * For a prismatic child this also fixes the DIRECTION it extends in. A rail
+   * bolted to an arm slides along the arm, because that is the direction the
+   * rail is pointing; it does not slide "up" in room coordinates. See the
+   * elevator branch of ChildBody.
+   */
   inheritsAngle: boolean;
   travelMin: number;
   travelMax: number;
@@ -284,8 +293,24 @@ function ChildBody({ child, len }: { child: ChildPose; len: number }) {
     const halfW = Math.max(2.5, len * 0.16);
     const carHalf = Math.max(5, len * 0.34);
     const carY = -railLen * frac;
+
+    /* WHICH WAY THE RAIL POINTS.
+       The mast is authored along local -Y ("up"), which is right for an
+       elevator standing on the floor. Mounted on a body that ROTATES, that is
+       wrong: a rail bolted to an arm extends along the ARM, so it has to run
+       down the parent's own axis (local +X, pointing away from the mount)
+       rather than at right angles to it.
+
+       Rotating the child's frame is not enough on its own and was the actual
+       bug -- the frame already turned with the arm, and faithfully carried the
+       perpendicular mast around with it, so the rail stayed stubbornly square
+       to the arm at every angle. The extension direction itself has to change,
+       not just the frame it lives in. rotate(90) maps local -Y onto +X, which
+       is the outward continuation of the parent. */
+    const alongParent = child.inheritsAngle;
+
     return (
-      <>
+      <g transform={alongParent ? 'rotate(90)' : undefined}>
         <rect x={-halfW} y={-railLen} width={halfW * 2} height={railLen} rx={2}
           fill={C.live} opacity={0.22} />
         <rect x={-halfW} y={-railLen} width={halfW * 2} height={railLen} rx={2}
@@ -298,7 +323,7 @@ function ChildBody({ child, len }: { child: ChildPose; len: number }) {
             <ChildBody child={child.child} len={nextLen} />
           </g>
         )}
-      </>
+      </g>
     );
   }
 

@@ -398,6 +398,17 @@ body {
   font-size: 12px;
 }
 .loadbar .iconbtn { margin-left: auto; }
+/* Same bar, success colouring -- an export that worked should not be styled
+   like an error, but it is the same shape of transient notice. */
+.loadbar.ok {
+  background: #1e2a22; border-bottom-color: #2f5c3f; color: var(--ok);
+}
+/* Warnings ride along with a successful export: the files were written, but
+   something in them needs a human. */
+.export-warn {
+  color: var(--ink-2); padding-left: 12px;
+  border-left: 1px solid var(--line-bright);
+}
 
 .graphs-wrap {
   flex: 1; min-width: 0; overflow-y: auto;
@@ -441,9 +452,23 @@ body {
   background: var(--panel-1); border: 1px solid var(--line);
   border-radius: var(--r); padding: 10px 14px;
 }
+/* Columns are capped at the chosen width rather than stretching to fill.
+   auto-fit + 1fr made every card grow to the panel width, so a design with one
+   mechanism drew a 200-unit sketch at ~900px and had to be scrolled. minmax(0,
+   W) keeps a track at most W wide, and still lets it shrink below W on a narrow
+   panel instead of overflowing. */
 .motion-grid {
   display: grid; gap: 14px;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(0, var(--motion-card-w, 260px)));
+  justify-content: start;
+}
+/* Belt and braces: even if a card ends up wider than intended, the drawing
+   itself never exceeds the chosen size. */
+.motion-stage svg { display: block; max-width: 100%; height: auto; }
+.motion-size {
+  display: flex; align-items: center; gap: 8px;
+  margin-left: auto; padding-left: 12px;
+  border-left: 1px solid var(--line-bright);
 }
 .motion-card {
   background: var(--panel-1); border: 1px solid var(--line);

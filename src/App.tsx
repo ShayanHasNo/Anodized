@@ -14,7 +14,7 @@ import { nodeTypes, TYPE_COLOR } from './canvas/nodes';
 import { edgeTypes } from './canvas/edges';
 import { Inspector } from './Inspector';
 import { Library } from './Library';
-import { ActionsView, compileProgram, programDuration, type Program } from './ActionsView';
+import { ActionsView, compileProgram, programDuration, type Program, type Action } from './ActionsView';
 import type { ResolvedStateGroup } from './sim/compile';
 import { serialize, deserialize, highestIdSuffix, downloadJson, filenameFor } from './persist';
 import { dimensionOf, conversionFactor, unitLabel } from './sim/units';
@@ -175,6 +175,7 @@ export default function App() {
   const [showLibrary, setShowLibrary] = useState(false);
   const [view, setView] = useState<'canvas' | 'graphs' | 'motion' | 'actions'>('canvas');
   const [programs, setPrograms] = useState<Program[]>([]);
+  const [actions, setActions] = useState<Action[]>([]);
   const [activeProgram, setActiveProgram] = useState<string | null>(null);
   /* Resolved at compile time, so the Inspector and Actions tab both see the
      controllers a state block can actually reach rather than guessing. */
@@ -484,10 +485,10 @@ export default function App() {
       const sys = compile(blocks, simEdges, groups);
       // No global target any more: a controller block owns its own setpoint.
       const prog = programs.find((p) => p.id === activeProgram) ?? null;
-      const schedule = prog ? compileProgram(prog, sys.stateGroups) : undefined;
+      const schedule = prog ? compileProgram(prog, sys.stateGroups, actions) : undefined;
       // A program needs enough runway to actually finish; pad past its last
       // wait so the final state has time to settle.
-      const runFor = prog ? Math.max(duration, programDuration(prog) + 1) : duration;
+      const runFor = prog ? Math.max(duration, programDuration(prog, actions) + 1) : duration;
       const r = simulate(sys, { duration: runFor, schedule });
       setResult(r);
       setStateGroups(sys.stateGroups);
@@ -509,7 +510,7 @@ export default function App() {
       setErrorBlockId(e instanceof CompileError ? e.blockId ?? null : null);
       setResult(null);
     }
-  }, [toSimEdges, blocks, duration, groups, programs, activeProgram]);
+  }, [toSimEdges, blocks, duration, groups, programs, actions, activeProgram]);
 
   /* Live tuning: re-run automatically a beat after anything changes, rather
      than making the person click Run after every field edit. Debounced so a
@@ -538,7 +539,7 @@ export default function App() {
          makes it look like the state block is broken rather than the schedule
          never having been handed over. */
       const prog = programs.find((p) => p.id === activeProgram) ?? null;
-      const schedule = prog ? compileProgram(prog, sys.stateGroups) : undefined;
+      const schedule = prog ? compileProgram(prog, sys.stateGroups, actions) : undefined;
       const r = createRun(sys, { duration: 2, schedule });
       liveRun.current = r;
       setStateGroups(sys.stateGroups);
@@ -583,7 +584,7 @@ export default function App() {
       cancelled = true;
       if (liveRaf.current !== null) cancelAnimationFrame(liveRaf.current);
     };
-  }, [runMode, liveRunning, blocks, toSimEdges, groups, programs, activeProgram]);
+  }, [runMode, liveRunning, blocks, toSimEdges, groups, programs, actions, activeProgram]);
 
   /* Series are built per plotter, so each one gets its own independent pair of
      axes. Unit families are assigned to axes in the order they appear within
@@ -821,7 +822,7 @@ export default function App() {
     setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, title } } : n)));
 
   const onSave = () => {
-    downloadJson(filenameFor(designName), serialize(nodes, edges, duration, designName, programs));
+    downloadJson(filenameFor(designName), serialize(nodes, edges, duration, designName, programs, actions));
   };
 
   const onLoadFile = async (file: File) => {
@@ -831,6 +832,7 @@ export default function App() {
       setEdges(parsed.edges);
       setDuration(parsed.duration);
       setDesignName(parsed.name);
+      setActions((parsed.actions as Action[]) ?? []);
       const loadedPrograms = (parsed.programs as Program[]) ?? [];
       setPrograms(loadedPrograms);
       /* Select the first program rather than leaving the file loaded with none
@@ -900,7 +902,8 @@ export default function App() {
             onClick={() => setView('motion')}>Motion</button>
           <button className={`tab${view === 'actions' ? ' on' : ''}`}
             onClick={() => setView('actions')}>
-            Actions{programs.length ? ` (${programs.length})` : ''}
+            Actions{actions.length + programs.length
+              ? ` (${actions.length + programs.length})` : ''}
           </button>
         </div>
         <button className="btn" onClick={onSave}>Save</button>
@@ -1063,8 +1066,9 @@ export default function App() {
             </ReactFlow>
           </div>
         ) : view === 'actions' ? (
-          <ActionsView programs={programs} groups={stateGroups}
-            activeId={activeProgram} onChange={setPrograms} onSelect={setActiveProgram} />
+          <ActionsView programs={programs} actions={actions} groups={stateGroups}
+            activeId={activeProgram} onChange={setPrograms}
+            onChangeActions={setActions} onSelect={setActiveProgram} />
         ) : view === 'motion' ? (
           <div className="graphs-wrap">
             <MotionView mechs={motionMechs} time={result?.time ?? new Float64Array()}

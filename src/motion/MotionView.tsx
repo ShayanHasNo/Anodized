@@ -39,6 +39,16 @@ function fmt(v: number): string {
   return v.toFixed(2);
 }
 
+const CARD_WIDTH_KEY = 'anodized.motion.cardWidth';
+const MIN_CARD_WIDTH = 150;
+const MAX_CARD_WIDTH = 560;
+/* Fits three or four mechanisms across a typical panel without scrolling,
+   which is the common case, while still being large enough to read. */
+const DEFAULT_CARD_WIDTH = 260;
+
+const clampWidth = (w: number) =>
+  Math.min(MAX_CARD_WIDTH, Math.max(MIN_CARD_WIDTH, w));
+
 export function MotionView({
   mechs, time, index, onIndex,
 }: {
@@ -49,6 +59,28 @@ export function MotionView({
 }) {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
+
+  /* How wide one mechanism is drawn, in px.
+     The grid used to stretch every card to fill the panel, so a design with a
+     single mechanism got ONE card at the full width of the window -- a 200px
+     drawing scaled up to 900px, which is why it read as wildly zoomed in and
+     needed scrolling to see. Capping the drawing fixes that, and making the
+     cap adjustable covers both directions: smaller to fit eight mechanisms on
+     screen at once, larger to inspect one closely. */
+  const [cardWidth, setCardWidth] = useState<number>(() => {
+    // Remembered across sessions: this is a per-person viewing preference, not
+    // a property of the design, so it belongs to the browser rather than the
+    // save file. Guarded because storage can be unavailable or full.
+    try {
+      const saved = parseInt(localStorage.getItem(CARD_WIDTH_KEY) ?? '', 10);
+      if (Number.isFinite(saved)) return clampWidth(saved);
+    } catch { /* fall through to the default */ }
+    return DEFAULT_CARD_WIDTH;
+  });
+
+  useEffect(() => {
+    try { localStorage.setItem(CARD_WIDTH_KEY, String(cardWidth)); } catch { /* ignore */ }
+  }, [cardWidth]);
   const raf = useRef<number | null>(null);
   const last = useRef<number>(0);
   const acc = useRef<number>(0);
@@ -218,9 +250,22 @@ export function MotionView({
               onClick={() => setSpeed(s)}>{s}×</button>
           ))}
         </div>
+
+        <div className="motion-size">
+          <span className="stat" style={{ color: 'var(--ink-3)' }}>Size</span>
+          <input
+            type="range" min={MIN_CARD_WIDTH} max={MAX_CARD_WIDTH} step={10}
+            value={cardWidth}
+            onChange={(e) => setCardWidth(clampWidth(parseInt(e.target.value, 10)))}
+            style={{ width: 96 }}
+            aria-label="Size of each mechanism drawing"
+          />
+          <button className="btn" onClick={() => setCardWidth(DEFAULT_CARD_WIDTH)}
+            title="Back to the default size">Reset</button>
+        </div>
       </div>
 
-      <div className="motion-grid">
+      <div className="motion-grid" style={{ ['--motion-card-w' as string]: `${cardWidth}px` }}>
         {roots.map((m) => {
           const firstChild = childrenOf.get(m.id)?.[0];
           const pos = m.position[i] ?? 0;
