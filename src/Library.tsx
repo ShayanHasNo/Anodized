@@ -18,7 +18,9 @@ const BLOCK_DOCS: { kind: string; name: string; desc: string }[] = [
   { kind: 'joint', name: 'Joint', desc: 'Connects two solids into a multi-part mechanism — an arm carrying a wrist. See "Joints" below for how to wire one.' },
   { kind: 'pid', name: 'PID', desc: 'Classic proportional-integral-derivative control on a position or velocity channel, plus a constant feedforward.' },
   { kind: 'bangbang', name: 'Bang-bang', desc: 'Full output toward the target, nothing inside a deadband. Cheap and chattery \u2014 no in-between.' },
+  { kind: 'voltage', name: 'Voltage', desc: 'Commands a fixed number of volts at the motor, open loop. Each step it divides that by the live bus voltage to get a duty, so the mechanism holds its voltage as the battery sags \u2014 unlike a raw duty, which quietly weakens under load. Saturates at full duty if you ask for more than the bus can give.' },
   { kind: 'lqr', name: 'LQR', desc: 'Full-state regulator. Derives its own plant from the attached chain and solves for gains \u2014 you only set costs, not gains.' },
+  { kind: 'state', name: 'States', desc: 'Named target presets \u2014 \u201cstow\u201d, \u201cL4\u201d \u2014 for every controller on a mechanism at once. Wire a MECHANISM BOX\u2019s hex port into it, not a solid: the box is what holds one complete chain, so the states reach every controller inside it plus everything jointed below it.' },
   { kind: 'plotter', name: 'Plotter', desc: 'Not part of the physics. Drag any hex port here to chart it against time.' },
 ];
 

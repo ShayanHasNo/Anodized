@@ -11,7 +11,8 @@
 
 import {
   Block, BatteryBlock, MotorBlock, GearBlock, SolidBlock,
-  ControllerBlock, LqrBlock, JointBlock, CONTROL_KINDS, Edge,
+  ControllerBlock, LqrBlock, JointBlock, StateBlock, MechanismState,
+  CONTROL_KINDS, Edge,
 } from './blocks';
 import { MotorConstants, getMotor } from './motors';
 import { scaleFromBase } from './units';
@@ -80,6 +81,27 @@ export interface Mechanism {
    * child is still visually mounted even though its gravity isn't coupled.
    */
   mountedOn: string | null;
+  /**
+   * The POWERED mechanism this one hangs off, which is not always the same as
+   * mountedOn: a wrist bolted to the top stage of a cascade is mounted on that
+   * stage, but the stage is an unpowered relay, so the mechanism that actually
+   * carries the wrist is the one down at the bottom with the motor in it.
+   *
+   * Both are needed. mountedOn is the structural truth and drives the drawing;
+   * this one is what anything reasoning about MECHANISMS has to walk, because
+   * a passive stage has no mechanism to walk to. A state block attached to an
+   * elevator finds the wrist through this field -- through mountedOn it would
+   * find solidE4, which is not a mechanism, and silently stop there.
+   */
+  mountedOnOwner: string | null;
+  /**
+   * Solids mounted on this one that have no motor of their own -- a cascade
+   * elevator's upper stages, driven by the same rigging as the first rather
+   * than independently powered. Their mass is reflected into this mechanism's
+   * inertia and gravity, and the solver records their channels as carried by
+   * this shaft rather than solving them separately.
+   */
+  passiveChildren: SolidBlock[];
 
   /** Controller driving the motor's command port, if one is wired up. */
   controller: ControllerBlock | null;
@@ -104,6 +126,19 @@ export interface Mechanism {
 export interface System {
   battery: BatteryBlock;
   mechanisms: Mechanism[];
+  /** State blocks, resolved against the controllers they can actually reach. */
+  stateGroups: ResolvedStateGroup[];
+}
+
+/** A state block plus the controllers it commands. */
+export interface ResolvedStateGroup {
+  blockId: string;
+  label: string;
+  /** Controller block ids this group can set, in mechanism order. */
+  controllerIds: string[];
+  /** Human labels for those controllers, for the inspector and Actions tab. */
+  controllerLabels: Record<string, string>;
+  states: MechanismState[];
 }
 
 export class CompileError extends Error {
@@ -281,7 +316,7 @@ function resolveMechanism(
     ratio, efficiency, radius, inertiaSolid, jEffOutput,
     friction: solid.friction, theta0, linearDisplay, gravityTorque,
     posScale, velScale, positionUnit, velocityUnit,
-    parentAngleSource: null, mountedOn: null,
+    parentAngleSource: null, mountedOn: null, mountedOnOwner: null, passiveChildren: [],
     controller, errorSource, lqrGains,
   };
 }
@@ -554,30 +589,79 @@ export function compile(
        deferred), and recursive reflection past one level (a grandchild's
        mass does not propagate through its parent to the grandparent). */
     const mechBySolidId = new Map(mechanisms.map((m) => [m.solid.id, m]));
+    const solidById = new Map(
+      blocks.filter((b): b is SolidBlock => b.kind === 'solid').map((b) => [b.id, b]),
+    );
     const childrenOfParent = new Map<string, Mechanism[]>();
+    const passiveOfParent = new Map<string, SolidBlock[]>();
+
+    // Every joint's parent, for every child, powered or not -- needed to walk
+    // UP through a chain of passive relays to find the real motor.
+    const parentOfSolid = new Map<string, string>();
+    for (const j of joints) parentOfSolid.set(childOfJoint.get(j.id)!, parentOfJoint.get(j.id)!);
+
+    /**
+     * Resolves a solid to the powered Mechanism that actually carries its
+     * load. Direct when the solid itself has a motor; otherwise walks up
+     * through however many unpowered relay stages sit in between -- a
+     * three-stage cascade has stage 3 mounted on stage 2, which is itself an
+     * unpowered relay mounted on stage 1's motor, and stage 3's weight still
+     * has to end up on stage 1's inertia, not get stuck on stage 2.
+     */
+    const resolveOwner = (solidId: string, jointId: string): Mechanism => {
+      let cur = solidId;
+      const seen = new Set<string>([solidId]);
+      while (!mechBySolidId.has(cur)) {
+        const next = parentOfSolid.get(cur);
+        if (!next || seen.has(next)) {
+          throw new CompileError(
+            `Joint "${jointId}" sits in a chain with no motor anywhere in it. A cascade needs at least one powered stage to carry the rest.`,
+            cur,
+          );
+        }
+        seen.add(next);
+        cur = next;
+      }
+      return mechBySolidId.get(cur)!;
+    };
 
     for (const j of joints) {
       const parentId = parentOfJoint.get(j.id)!;
       const childId = childOfJoint.get(j.id)!;
-      const parentMech = mechBySolidId.get(parentId);
       const childMech = mechBySolidId.get(childId);
-      if (!parentMech) {
-        throw new CompileError(
-          `Joint "${j.id}" is mounted on "${parentId}", but "${parentId}" has no motor driving it. Every mechanism needs its own motor, gearbox, and solid.`,
-          parentId,
-        );
-      }
+      const ownerMech = resolveOwner(parentId, j.id);
+
       if (!childMech) {
-        throw new CompileError(
-          `Joint "${j.id}" mounts "${childId}", but "${childId}" has no motor driving it. Every mechanism needs its own motor, gearbox, and solid.`,
-          childId,
-        );
+        /* An unpowered child is legitimate, not an error. A cascade elevator
+           has ONE motor driving rigging that lifts every stage -- the upper
+           stages are carried, not independently powered. Same for any dead
+           weight bolted to a mechanism. It contributes its mass and nothing
+           else, reflected onto whichever mechanism actually has the motor --
+           which may be several relay stages up, not just the immediate
+           parent. */
+        const passive = solidById.get(childId);
+        if (!passive) {
+          throw new CompileError(
+            `Joint "${j.id}" mounts "${childId}", which isn't a solid block.`,
+            childId,
+          );
+        }
+        const list = passiveOfParent.get(ownerMech.solid.id) ?? [];
+        list.push(passive);
+        passiveOfParent.set(ownerMech.solid.id, list);
+        ownerMech.passiveChildren.push(passive);
+        continue;
       }
+
+      // mountedOn stays the IMMEDIATE parent -- the Motion tab draws each
+      // visual link in the chain, not just the root, so it needs the real
+      // neighbour even though the physics reflects mass further up.
       childMech.mountedOn = parentId;
+      childMech.mountedOnOwner = ownerMech.solid.id;
       if (j.jointType === 'revolute') childMech.parentAngleSource = parentId;
-      const list = childrenOfParent.get(parentId) ?? [];
+      const list = childrenOfParent.get(ownerMech.solid.id) ?? [];
       list.push(childMech);
-      childrenOfParent.set(parentId, list);
+      childrenOfParent.set(ownerMech.solid.id, list);
     }
 
     const deriveLqrGains = (mech: Mechanism) => {
@@ -592,9 +676,16 @@ export function compile(
       mech.lqrGains = { k1, k2, a, b };
     };
 
-    for (const [parentId, children] of childrenOfParent) {
+    // Every parent that carries anything at all -- powered children, passive
+    // children, or both -- needs its inertia and gravity adjusted.
+    const parentsWithLoad = new Set([...childrenOfParent.keys(), ...passiveOfParent.keys()]);
+    for (const parentId of parentsWithLoad) {
       const parentMech = mechBySolidId.get(parentId)!;
-      const totalChildMass = children.reduce((sum, c) => sum + c.solid.mass, 0);
+      const powered = childrenOfParent.get(parentId) ?? [];
+      const passive = passiveOfParent.get(parentId) ?? [];
+      const totalChildMass =
+        powered.reduce((sum, c) => sum + c.solid.mass, 0)
+        + passive.reduce((sum, sb) => sum + sb.mass, 0);
       const oldGravityTorque = parentMech.gravityTorque;
 
       if (parentMech.linearDisplay) {
@@ -621,7 +712,107 @@ export function compile(
     }
   }
 
-  return { battery, mechanisms };
+  /* --- state blocks --------------------------------------------------------
+     A state block is wired to a MECHANISM BOX, and commands every controller
+     inside that box PLUS every controller on anything jointed below it -- so
+     one "scoring" state sets an elevator and the wrist riding on it together,
+     which is the whole point of having states rather than typing targets into
+     each controller by hand.
+
+     The box is the unit of attachment because the box is what this compiler
+     already validates as "one mechanism": exactly one motor, its gears, and
+     the solid it drives. A solid is only a part of that. Files saved before
+     this change wired a solid's hex port in instead, so that still resolves --
+     it just is not what the canvas offers any more. */
+  const stateBlocks = blocks.filter((b): b is StateBlock => b.kind === 'state');
+  const groupById = new Map(groups.map((g) => [g.id, g]));
+
+  const stateGroups: ResolvedStateGroup[] = stateBlocks.map((sb) => {
+    const sources = edges
+      .filter((e) => e.to.blockId === sb.id && e.to.portId === 'mechanism')
+      .map((e) => e.from.blockId);
+
+    if (sources.length === 0) {
+      throw new CompileError(
+        `State block "${sb.label || sb.id}" isn't attached to anything. Wire a mechanism box's hex port into its input.`,
+        sb.id,
+      );
+    }
+    /* A signal port has no cardinality limit -- that is right for a plotter,
+       which can take any number of taps, but wrong here: two boxes wired in
+       would silently mean the states command whichever one happened to be
+       found first, and the other box's controllers would just be missing from
+       the inspector with no explanation. */
+    if (sources.length > 1) {
+      throw new CompileError(
+        `State block "${sb.label || sb.id}" is wired to ${sources.length} mechanisms (${sources.join(', ')}). One state block commands one mechanism and whatever is jointed below it — give the second its own.`,
+        sb.id,
+      );
+    }
+    const sourceId = sources[0];
+
+    /* Two shapes resolve to the same thing: a box (the current way) supplies
+       every mechanism whose motor sits inside it, and a solid (the legacy way)
+       supplies just its own. Everything after this point is identical. */
+    let roots: Mechanism[];
+    const box = groupById.get(sourceId);
+    if (box) {
+      const inside = new Set(box.memberIds);
+      roots = mechanisms.filter((m) => inside.has(m.motorBlock.id));
+      if (roots.length === 0) {
+        throw new CompileError(
+          `State block "${sb.label || sb.id}" is attached to "${box.label}", which has no mechanism in it. A box needs a motor, its gears, and the solid it drives before states can command it.`,
+          sb.id,
+        );
+      }
+    } else {
+      const rootMech = mechanisms.find((m) => m.solid.id === sourceId);
+      if (!rootMech) {
+        throw new CompileError(
+          `State block "${sb.label || sb.id}" is attached to "${sourceId}", which is neither a mechanism box nor a solid with a motor driving it.`,
+          sb.id,
+        );
+      }
+      roots = [rootMech];
+    }
+
+    /* Collect the roots plus everything mounted below them, breadth-first.
+       Descent follows mountedOnOwner, not mountedOn: a wrist on the top stage
+       of a cascade is structurally mounted on that stage, but the stage is an
+       unpowered relay with no mechanism of its own, so walking mountedOn would
+       stop dead there and quietly drop the wrist's controller from the group.
+       mountedOnOwner points at the powered mechanism that actually carries it,
+       which is the one in this list. */
+    const reached: Mechanism[] = [];
+    const queue = [...roots];
+    const seen = new Set<string>();
+    while (queue.length) {
+      const cur = queue.shift()!;
+      if (seen.has(cur.solid.id)) continue;
+      seen.add(cur.solid.id);
+      reached.push(cur);
+      for (const m of mechanisms) {
+        if ((m.mountedOnOwner ?? m.mountedOn) === cur.solid.id) queue.push(m);
+      }
+    }
+
+    const controllerIds: string[] = [];
+    const controllerLabels: Record<string, string> = {};
+    for (const m of reached) {
+      if (!m.controller) continue;
+      controllerIds.push(m.controller.id);
+      controllerLabels[m.controller.id] = `${m.solid.id} · ${m.controller.kind}`;
+    }
+    if (controllerIds.length === 0) {
+      throw new CompileError(
+        `State block "${sb.label || sb.id}" reaches no controllers — nothing it is attached to has a PID, bang-bang, LQR, or voltage block driving it.`,
+        sb.id,
+      );
+    }
+    return { blockId: sb.id, label: sb.label || sb.id, controllerIds, controllerLabels, states: sb.states };
+  });
+
+  return { battery, mechanisms, stateGroups };
 }
 
 /** Convenience constructors so common inertias do not have to be looked up. */

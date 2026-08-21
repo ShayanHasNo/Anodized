@@ -159,7 +159,29 @@ export interface PidBlock {
   kF: number;
 }
 
-export type ControllerBlock = PidBlock | BangBangBlock | LqrBlock;
+export type ControllerBlock = PidBlock | BangBangBlock | LqrBlock | VoltageBlock;
+
+/**
+ * Voltage: the one controller with no feedback at all. It commands a fixed
+ * number of VOLTS at the motor, and the duty needed to produce them follows
+ * from the bus: duty = V_command / V_bus.
+ *
+ * That division is the entire point, and it is why this is not the same thing
+ * as typing a duty into the motor block. A duty of 0.5 means half of whatever
+ * the bus happens to be -- 6.3 V on a fresh battery, 5.5 V once four
+ * mechanisms are pulling it down, so the mechanism gets weaker exactly when
+ * the rest of the robot gets busy. A voltage command holds 6 V through the
+ * sag by raising duty to compensate, which is what WPILib's setVoltage() does
+ * and why feedforward gains (kS, kV, kA) are published in volts rather than
+ * duty. Commanding more volts than the bus can supply saturates at full duty,
+ * the same as the real thing.
+ */
+export interface VoltageBlock {
+  kind: 'voltage';
+  id: string;
+  /** Commanded motor voltage, signed. Negative drives the other way. */
+  volts: number;
+}
 
 /**
  * Bang-bang: full output in whichever direction closes the error, nothing in
@@ -209,9 +231,41 @@ export interface LqrBlock {
 }
 
 /** Blocks that command the physics rather than being part of it. */
-export const CONTROL_KINDS: ReadonlySet<string> = new Set(['pid', 'bangbang', 'lqr']);
+export const CONTROL_KINDS: ReadonlySet<string> = new Set(['pid', 'bangbang', 'lqr', 'voltage']);
 
 export type JointType = 'revolute' | 'prismatic';
+
+/**
+ * A named set of controller targets -- "stowed", "scoring", "intake". The
+ * targets map is keyed by controller block id, so a state can command several
+ * controllers at once (an arm AND its wrist) from one selection.
+ */
+export interface MechanismState {
+  name: string;
+  /** controller block id -> target, in that controller's own display units. */
+  targets: Record<string, number>;
+}
+
+/**
+ * Attaches to a MECHANISM BOX -- wire the box's hex port into this block's
+ * input -- and holds named target presets for every controller inside that
+ * box, plus every controller on anything jointed below it.
+ *
+ * The box is the right thing to attach to because the box is already the
+ * app's unit of "one mechanism": it is what the compiler validates as holding
+ * exactly one complete chain, and what carries the human-readable name. Wiring
+ * to a solid instead made the state block point at an implementation detail of
+ * the mechanism rather than the mechanism itself, and left the arbitrary
+ * question of WHICH solid to pick in a chain that has several. Attaching to a
+ * solid still works, so older files keep loading, but the box is the path the
+ * UI offers.
+ */
+export interface StateBlock {
+  kind: 'state';
+  id: string;
+  label: string;
+  states: MechanismState[];
+}
 
 /**
  * Connects a parent solid's tip to a child solid's mount, forming a
@@ -235,7 +289,8 @@ export interface JointBlock {
 }
 
 export type Block =
-  | BatteryBlock | MotorBlock | GearBlock | SolidBlock | ControllerBlock | JointBlock;
+  | BatteryBlock | MotorBlock | GearBlock | SolidBlock | ControllerBlock
+  | JointBlock | StateBlock;
 
 // --- Signal channels --------------------------------------------------------
 
@@ -297,6 +352,12 @@ export function channelsFor(block: Block): Channel[] {
         { key: p('k1'), label: 'K (position gain)', unit: '', family: 'gain' },
         { key: p('k2'), label: 'K (velocity gain)', unit: '', family: 'gain' },
       ];
+    case 'voltage':
+      return [
+        { key: p('commanded'), label: 'Commanded voltage', unit: 'V', family: 'voltage' },
+        { key: p('applied'), label: 'Applied voltage', unit: 'V', family: 'voltage' },
+        { key: p('output'), label: 'Output (duty)', unit: '', family: 'duty' },
+      ];
     case 'solid': {
       const linear = block.gravityMode === 'constant';
       const posUnit = block.positionUnit ?? (linear ? 'm' : 'deg');
@@ -309,6 +370,7 @@ export function channelsFor(block: Block): Channel[] {
       ];
     }
     case 'joint':
+    case 'state':
       return [];
   }
 }
@@ -381,10 +443,24 @@ export function portsFor(block: Block): Port[] {
         { id: 'parent', type: 'mount', direction: 'in' },
         { id: 'child', type: 'mount', direction: 'out' },
       ];
+    case 'state':
+      // One signal input: wire a MECHANISM BOX into it. The state block then
+      // discovers every controller in that box, plus every controller on
+      // anything jointed below it.
+      return [{ id: 'mechanism', type: 'signal', direction: 'in' }];
     case 'pid':
     case 'bangbang':
       return [
         { id: 'measure', type: 'signal', direction: 'in' },
+        { id: 'command', type: 'control', direction: 'out' },
+        sig,
+      ];
+    case 'voltage':
+      // No hex input: there is nothing to measure. An open-loop voltage
+      // command is a function of the bus and its own setting, full stop --
+      // giving it a measure port would imply a feedback path that does not
+      // exist.
+      return [
         { id: 'command', type: 'control', direction: 'out' },
         sig,
       ];

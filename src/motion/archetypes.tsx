@@ -30,6 +30,34 @@ const C = {
   ghost: '#B4B2A9',
 };
 
+/**
+ * One colour per cascade stage.
+ *
+ * A cascade drawn in a single colour is unreadable once the stages overlap:
+ * every stage is the same shape as the one under it, so at rest they are one
+ * indistinguishable blob and mid-travel it is impossible to tell which edge
+ * belongs to which stage. Opacity alone does not fix it -- stacked
+ * translucent rectangles of the same hue read as one gradient, not as
+ * separate parts.
+ *
+ * Distinct hues do fix it, and they buy the thing that actually matters: the
+ * eye can follow ONE stage through the motion and see how far it went, which
+ * is the whole question a cascade animation is there to answer. These are
+ * picked to stay distinguishable side by side and to hold up when nested, and
+ * they are exported so the Motion tab's legend can label them with the same
+ * colours it draws them in.
+ */
+export const STAGE_COLORS: { fill: string; edge: string }[] = [
+  { fill: '#EF9F27', edge: '#7A4E09' }, // amber -- the base stage
+  { fill: '#5EA8D9', edge: '#20516F' }, // blue
+  { fill: '#79C07C', edge: '#2F5E33' }, // green
+  { fill: '#C98BC7', edge: '#5F3A5D' }, // mauve
+  { fill: '#E0714B', edge: '#75301A' }, // rust
+  { fill: '#BFB44E', edge: '#5C551A' }, // olive
+];
+
+export const stageColor = (i: number) => STAGE_COLORS[i % STAGE_COLORS.length];
+
 function Ghost({ d }: { d: string }) {
   return (
     <path d={d} fill="none" stroke={C.ghost} strokeWidth={1.5}
@@ -59,34 +87,65 @@ export function ArmPose({ angle, setpoint }: { angle: number; setpoint: number |
 
 /** One stage of an elevator, in its own display units. */
 export interface ElevatorStage {
+  /** Name shown in the Motion tab's colour legend. */
+  label: string;
   position: number;
   min: number;
   max: number;
   setpoint: number | null;
+  /** False for a stage carried by the rigging rather than driven directly. */
+  powered: boolean;
 }
 
 /**
- * Elevator, drawn from the SIDE: a thin vertical mast rather than a wide box,
- * which is how an elevator actually looks on a robot and makes the travel the
- * dominant visual rather than the carriage.
+ * Elevator, drawn from the SIDE as a set of NESTED RECTANGLES -- one long
+ * rectangle per stage, each riding inside the one below it and each in its own
+ * colour.
  *
- * Several stages chained by prismatic joints render as a cascade -- nested
- * tubes, each riding on the one below and getting slightly narrower going up,
- * the way a real telescoping elevator does. Because each stage rides the one
- * below it, stage heights are CUMULATIVE: the top carriage sits at the sum of
- * every stage's extension, which is exactly what a cascade buys you and what
- * makes it worth drawing differently from a single stage.
+ * This is the shape a real telescoping cascade has, and drawing it literally
+ * is what makes it readable. The stages are all the same LENGTH, which is the
+ * property that matters: fully retracted they sit on top of each other and the
+ * mechanism is one stage tall, and as it extends they slide apart and stagger,
+ * so the silhouette grows to the sum of the extensions while each individual
+ * part stays the size it actually is. The previous drawing shortened each
+ * stage's rectangle as the stack grew, which made the parts appear to change
+ * length -- the one thing a rigid stage never does.
+ *
+ * Widths taper going up (each stage is narrower than the one carrying it, as
+ * it must be to nest inside it) and each stage gets a distinct hue, so a
+ * single stage can be followed by eye through the whole travel.
+ *
+ * Heights are CUMULATIVE: stage n rides on everything below it, so the top
+ * carriage sits at the sum of every stage's extension. That is exactly what a
+ * cascade buys you, and why it is worth drawing differently from a single mast.
+ *
+ * A non-elevator mechanism carried on the top carriage (a wrist, an arm) is
+ * drawn there via `child`, in the carriage's frame -- a carriage does not
+ * rotate, so the child never inherits an angle from it.
  */
 export function ElevatorPose({
-  stages,
-}: { stages: ElevatorStage[] }) {
-  const ground = 178, ceiling = 22;
+  stages, child,
+}: { stages: ElevatorStage[]; child?: ChildPose }) {
+  /* A mechanism riding the carriage swings around it, and at full extension
+     the carriage is at the very top of the frame -- so a wrist pointing up
+     there would be drawn off the top of the box. Lowering the ceiling when
+     something is mounted reserves exactly that swing room. It costs a little
+     travel resolution and keeps every pose inside the frame at every point in
+     the run, which matters more: a pose that leaves the box is not a small
+     cosmetic problem, it is a frame where the mechanism appears to vanish. */
+  const ground = 182;
+  const ceiling = child ? 52 : 16;
   const budget = ground - ceiling;
 
-  // Scale so the fully-extended cascade exactly fills the frame. Sum of the
-  // per-stage maxima, not the max of them, since they stack.
-  const totalMax = stages.reduce((s, st) => s + Math.max(0, st.max - st.min), 0);
-  const scale = totalMax < 1e-9 ? 0 : (budget * 0.92) / totalMax;
+  /* Split the frame between travel and stage length. Every stage is drawn the
+     same length, and at full extension the stack has to still fit -- so the
+     travel gets 62% of the box and one stage length gets the remaining 38%,
+     which is what makes a fully-extended cascade exactly fill the frame
+     instead of running off the top. */
+  const totalMax = stages.reduce((sum, st) => sum + Math.max(0, st.max - st.min), 0);
+  const travelBudget = budget * 0.62;
+  const stageH = budget - travelBudget;
+  const scale = totalMax < 1e-9 ? 0 : travelBudget / totalMax;
 
   // Each stage's own extension, and how far the stages below have lifted it.
   const ext = stages.map((st) => Math.max(0, st.position - st.min) * scale);
@@ -94,47 +153,71 @@ export function ElevatorPose({
   let running = 0;
   for (const e of ext) { liftBelow.push(running); running += e; }
 
-  // Setpoint marker: the cascade's total commanded height, when every stage
-  // has one. A partial set would be misleading, so it's all or nothing.
+  /* The carriage rides the TOP EDGE of the last stage, which is that stage's
+     own bottom (the ground less everything lifting it) less its length. It is
+     NOT the running total: that sum is where the last stage's bottom ends up,
+     one whole stage length lower, which would bury the carriage inside the
+     stack instead of sitting it on top. */
+  const carriageY = ground - liftBelow[stages.length - 1] - stageH;
+
+  /* Setpoint marker: the cascade's total commanded height. Only drawn when
+     every stage has one -- a partial sum would be a number that corresponds to
+     no commanded position at all, which is worse than no marker. Passive
+     stages have no setpoint of their own, so a cascade with rigged stages
+     shows the marker on the driven stage's own mast instead (below). */
   const allHaveSetpoint = stages.every((st) => st.setpoint !== null);
   const setpointY = allHaveSetpoint
-    ? ground - stages.reduce((s, st) => s + Math.max(0, (st.setpoint as number) - st.min) * scale, 0)
+    ? ground - stages.reduce(
+      (sum, st) => sum + Math.max(0, (st.setpoint as number) - st.min) * scale, 0)
     : null;
 
-  const railH = budget / Math.max(1, stages.length) * 1.15;
+  const halfWidthOf = (i: number) => Math.max(9, 30 - i * 4.5);
 
   return (
     <svg viewBox={`0 0 ${BOX} ${BOX}`} width="100%" role="img"
-      aria-label={stages.length > 1 ? `Cascade elevator, ${stages.length} stages` : 'Elevator position'}>
+      aria-label={stages.length > 1
+        ? `Cascade elevator, ${stages.length} nested stages`
+        : 'Elevator position'}>
       {/* base plate -- gives the side view something to stand on */}
-      <rect x={64} y={ground} width={72} height={5} rx={2} fill={C.frame} opacity={0.55} />
-      {setpointY !== null && <Ghost d={`M56 ${setpointY} L144 ${setpointY}`} />}
+      <rect x={100 - halfWidthOf(0) - 10} y={ground} width={(halfWidthOf(0) + 10) * 2}
+        height={5} rx={2} fill={C.frame} opacity={0.55} />
+      {setpointY !== null && <Ghost d={`M46 ${setpointY} L154 ${setpointY}`} />}
 
-      {stages.map((_, i) => {
-        const halfW = Math.max(4, 11 - i * 2.2);
+      {/* Painted bottom stage first so each nested stage lands ON TOP of the
+          one carrying it, which is the stacking a real cascade has. */}
+      {stages.map((st, i) => {
+        const halfW = halfWidthOf(i);
         const bottom = ground - liftBelow[i];
-        const top = Math.max(ceiling - 6, bottom - railH);
+        const top = bottom - stageH;
+        const c = stageColor(i);
         return (
           <g key={i}>
-            <rect x={100 - halfW} y={top} width={halfW * 2} height={bottom - top}
-              rx={3} fill={C.live} opacity={0.20 + i * 0.06} />
-            <rect x={100 - halfW} y={top} width={halfW * 2} height={bottom - top}
-              rx={3} fill="none" stroke={C.liveDark} strokeWidth={0.5} opacity={0.8} />
+            <rect x={100 - halfW} y={top} width={halfW * 2} height={stageH}
+              rx={4} fill={c.fill} opacity={0.9} />
+            <rect x={100 - halfW} y={top} width={halfW * 2} height={stageH}
+              rx={4} fill="none" stroke={c.edge} strokeWidth={1.2} />
+            {/* A rigged stage is marked rather than recoloured, so the colour
+                keeps meaning "which stage" and nothing else. */}
+            {!st.powered && (
+              <line x1={100 - halfW + 4} y1={top + 7} x2={100 + halfW - 4} y2={top + 7}
+                stroke={c.edge} strokeWidth={1} strokeDasharray="3 3" opacity={0.8} />
+            )}
           </g>
         );
       })}
 
-      {/* carriage rides the top of the last stage */}
-      {(() => {
-        const topOfStack = ground - running;
-        return (
-          <>
-            <rect x={84} y={topOfStack - 9} width={32} height={16} rx={4} fill={C.live} />
-            <rect x={84} y={topOfStack - 9} width={32} height={16} rx={4} fill="none"
-              stroke={C.liveDark} strokeWidth={0.5} />
-          </>
-        );
-      })()}
+      {/* Carriage rides the top of the last stage. */}
+      <rect x={100 - halfWidthOf(stages.length - 1) - 5} y={carriageY - 6}
+        width={(halfWidthOf(stages.length - 1) + 5) * 2} height={13} rx={3}
+        fill={C.frame} opacity={0.9} />
+
+      {/* Anything mounted on the carriage rides up with it. */}
+      {child && (
+        <g transform={`translate(100 ${carriageY - 6})`}>
+          <circle cx={0} cy={0} r={5} fill={C.frame} />
+          <ChildBody child={child} len={30} />
+        </g>
+      )}
     </svg>
   );
 }

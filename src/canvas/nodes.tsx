@@ -29,7 +29,9 @@ export const KIND_ACCENT: Record<string, string> = {
   pid: 'var(--control)',
   bangbang: 'var(--control)',
   lqr: 'var(--control)',
+  voltage: 'var(--control)',
   joint: 'var(--ink-3)',
+  state: 'var(--ok)',
 };
 
 function Port({
@@ -242,6 +244,19 @@ export function LqrNode({ data, id, selected }: NodeProps) {
   );
 }
 
+export function VoltageNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'voltage' }>;
+  const hasError = (data as Data).hasError;
+  return (
+    <Shell kind="voltage" id={id} selected={selected} hasError={hasError}
+      title={`${b.volts.toFixed(2)} V`}
+      sub={<>open loop — no feedback<br />duty = V ÷ bus, each step</>}>
+      <Port id="command" type="control" direction="out" position={Position.Right} offset="66%" />
+      <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
+    </Shell>
+  );
+}
+
 export function GroupNode({ id, selected, data }: NodeProps) {
   const d = data as Record<string, unknown>;
   const label = (d.label as string) || 'Mechanism';
@@ -259,9 +274,35 @@ export function GroupNode({ id, selected, data }: NodeProps) {
         <div className="mech-group-tab">
           <span className="mech-group-label">{label}</span>
           <span className="node-id">{count === 0 ? 'empty' : `${count} blocks`}</span>
+          {/* The box's one port: what a state block attaches to. It lives on
+              the title tab rather than the box edge so it stays put when the
+              box is resized, and so dragging from it can never be confused
+              with dragging a resize handle. */}
+          <span className="group-port">
+            <span className="handle-tag" style={{ top: -16, left: -18 }}>states</span>
+            <Handle
+              id="mechanism" type="source" position={Position.Right}
+              className="xy-handle hexagon"
+              style={{ ['--h' as string]: TYPE_COLOR.signal, position: 'relative', top: 0, right: 0, transform: 'none' }}
+              title="mechanism — signal"
+            />
+          </span>
         </div>
       </div>
     </>
+  );
+}
+
+export function StateNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'state' }>;
+  const hasError = (data as Data).hasError;
+  return (
+    <Shell kind="state" id={id} selected={selected} hasError={hasError}
+      title={b.label || 'States'}
+      sub={<>{b.states.length === 0 ? 'no states yet' : `${b.states.length} state${b.states.length === 1 ? '' : 's'}`}<br />
+        wire a mechanism box in</>}>
+      <Port id="mechanism" type="signal" direction="in" position={Position.Left} offset="55%" />
+    </Shell>
   );
 }
 
@@ -275,5 +316,7 @@ export const nodeTypes = {
   bangbang: BangBangNode,
   lqr: LqrNode,
   joint: JointNode,
+  state: StateNode,
+  voltage: VoltageNode,
   group: GroupNode,
 };

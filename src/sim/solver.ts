@@ -25,12 +25,26 @@ import { Channel, channelsFor } from './blocks';
 export interface SimOptions {
   duration: number; // seconds
   dt?: number;       // override the auto-selected timestep
+  schedule?: ScheduleEvent[];
+}
+
+/**
+ * A timed target change. A program compiles down to a list of these -- "at
+ * t=0 set the arm to 90 and the wrist to -20, at t=1.5 set them to 0" -- which
+ * keeps the solver a pure function of its inputs and keeps batch and live runs
+ * identical. No program state lives inside the loop.
+ */
+export interface ScheduleEvent {
+  time: number;
+  /** controller block id -> new target, in that controller's display units. */
+  targets: Record<string, number>;
 }
 
 export interface RunOptions {
   /** Seconds to pre-allocate for. A live run grows past this as needed. */
   duration: number;
   dt?: number;
+  schedule?: ScheduleEvent[];
 }
 
 /**
@@ -63,6 +77,15 @@ export interface MechanismResult {
   overshoot: number | null;
   /** The solid id this one is joint-mounted on, or null if it stands alone. */
   parentSolidId: string | null;
+  /**
+   * The solid id of the POWERED mechanism carrying this one. Differs from
+   * parentSolidId when the immediate parent is an unpowered relay stage --
+   * a wrist on the top stage of a cascade names that stage above, and names
+   * the driven bottom stage here.
+   */
+  parentOwnerSolidId: string | null;
+  /** Ids of unpowered stages carried by this mechanism, in mount order. */
+  passiveChildIds: string[];
 }
 
 export interface SimResult {
@@ -193,6 +216,9 @@ export function createRun(sys: System, opts: RunOptions): Run {
       ...channelsFor(m.motorBlock),
       ...m.gears.flatMap((g) => channelsFor(g)),
       ...channelsFor(m.solid),
+      // Passive carried stages get channels too, so they can be plotted and
+      // drawn even though they are not solved independently.
+      ...m.passiveChildren.flatMap((sb) => channelsFor(sb)),
       ...(m.controller ? channelsFor(m.controller) : []),
     ]),
   ];
@@ -215,13 +241,36 @@ export function createRun(sys: System, opts: RunOptions): Run {
     time = t2;
   }
 
+  /* Target overrides from the schedule. Sorted once; a cursor walks forward
+     as simulated time passes each event, so applying them is O(1) per step
+     rather than a scan. */
+  const schedule = [...(opts.schedule ?? [])].sort((a, b) => a.time - b.time);
+  const activeTargets: Record<string, number> = {};
+  let scheduleCursor = 0;
+
   let minBusVoltage = vOc;
   let peakTotalCurrent = 0;
+
+  /* Last step's resolved bus voltage. A voltage command has to be divided by
+     the bus to become a duty, but the bus is not known until every branch's
+     duty is in -- that is a genuine algebraic loop, not an ordering mistake.
+     Using the previous step's value breaks it. The lag is one dt (a millisecond
+     at most, since dt is picked against the stiffest mechanism), which is far
+     shorter than the electrical transient it is standing in for, and it is
+     exactly the lag a real controller has: it reads the bus, then writes the
+     duty it computed from that reading. Seeded at open-circuit so the very
+     first step behaves like an unloaded battery. */
+  let busPrev = vOc;
 
   let i = 0;
   function stepOnce() {
     if (i >= capacity) grow();
     const t = i * dt;
+
+    while (scheduleCursor < schedule.length && schedule[scheduleCursor].time <= t) {
+      Object.assign(activeTargets, schedule[scheduleCursor].targets);
+      scheduleCursor++;
+    }
 
     // ---- pass 1: each branch's controller, independent of the others -------
     const branchOut = branches.map((br) => {
@@ -231,11 +280,13 @@ export function createRun(sys: System, opts: RunOptions): Run {
       let pidErr = 0, pidP = 0, pidI = 0, pidD = 0, pidOut = 0;
       let bbErr = 0, bbOut = 0;
       let lqrPosErr = 0, lqrVelErr = 0, lqrOut = 0, lqrFF = 0;
+      let voltCmd = 0;
 
       if (ctrl && ctrl.kind === 'pid') {
         const pid = ctrl;
         const meas = br.measure(br.theta, br.omega);
-        pidErr = pid.target - meas;
+        const pidTarget = activeTargets[pid.id] ?? pid.target;
+        pidErr = pidTarget - meas;
 
         // Derivative on MEASUREMENT, not on error -- differentiating error
         // spikes the output the instant a setpoint changes.
@@ -259,7 +310,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
       } else if (ctrl && ctrl.kind === 'bangbang') {
         const bb = ctrl;
         const meas = br.measure(br.theta, br.omega);
-        bbErr = bb.target - meas;
+        bbErr = (activeTargets[bb.id] ?? bb.target) - meas;
         bbOut = bbErr > bb.deadband ? bb.output : bbErr < -bb.deadband ? -bb.output : 0;
         duty = bbOut;
       } else if (ctrl && ctrl.kind === 'lqr' && mech.lqrGains) {
@@ -270,7 +321,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
         // velocity CHANNEL is set to display -- targetVel is in posUnit/s.
         const posMeas = br.theta * br.posScale;
         const velMeas = br.omega * br.posScale;
-        lqrPosErr = lqr.targetPos - posMeas;
+        lqrPosErr = (activeTargets[lqr.id] ?? lqr.targetPos) - posMeas;
         lqrVelErr = lqr.targetVel - velMeas;
 
         if (lqr.gravityFeedforward) {
@@ -281,6 +332,13 @@ export function createRun(sys: System, opts: RunOptions): Run {
 
         lqrOut = mech.lqrGains.k1 * lqrPosErr + mech.lqrGains.k2 * lqrVelErr + lqrFF;
         duty = lqrOut;
+      } else if (ctrl && ctrl.kind === 'voltage') {
+        // Open loop: no measurement, no error, no gains. The commanded volts
+        // are turned into the duty that would produce them across the bus as
+        // it stood a step ago. Asking for more than the bus can give saturates
+        // at full duty below, which is what a real controller does too.
+        voltCmd = activeTargets[ctrl.id] ?? ctrl.volts;
+        duty = voltCmd / Math.max(1e-6, busPrev);
       } else {
         duty = mech.motorBlock.duty;
       }
@@ -299,7 +357,8 @@ export function createRun(sys: System, opts: RunOptions): Run {
       // the whole solve.
       const A = (br.n * D * D) / br.R;
       const B = (br.n * D * omegaMotor) / (br.Kv * br.R);
-      return { D, omegaMotor, A, B, pidErr, pidP, pidI, pidD, pidOut, bbErr, bbOut, lqrPosErr, lqrVelErr, lqrOut, lqrFF };
+      return { D, omegaMotor, A, B, pidErr, pidP, pidI, pidD, pidOut, bbErr, bbOut,
+        lqrPosErr, lqrVelErr, lqrOut, lqrFF, voltCmd };
     });
 
     // ---- solve the shared bus: V_bus(1 + Rbatt*sum A) = Voc + Rbatt*sum B ---
@@ -371,10 +430,27 @@ export function createRun(sys: System, opts: RunOptions): Run {
       data[`${mech.solid.id}.acceleration`][i] = alpha * br.velScale;
       data[`${mech.solid.id}.gravityTorque`][i] = tauGrav;
 
+      /* A passive stage is carried rigidly by its parent: same travel, same
+         speed. Real cascade rigging multiplies an upper stage's motion (stage
+         two moves twice the drum travel on a continuously-rigged elevator),
+         which is NOT modelled here -- there is no rigging-ratio field yet, so
+         the honest thing is to show it moving with its parent rather than
+         invent a multiplier. Its mass IS fully accounted for in the parent's
+         inertia and gravity, so the load on the motor is right either way. */
+      for (const sb of mech.passiveChildren) {
+        data[`${sb.id}.position`][i] = br.theta * br.posScale;
+        data[`${sb.id}.velocity`][i] = br.omega * br.velScale;
+        data[`${sb.id}.acceleration`][i] = alpha * br.velScale;
+        data[`${sb.id}.gravityTorque`][i] = mech.linearDisplay && mech.radius
+          ? sb.mass * G_ACCEL * mech.radius
+          : 0;
+      }
+
       const ctrl = mech.controller;
       const pidLike = ctrl && (ctrl.kind === 'pid' || ctrl.kind === 'bangbang');
       if (pidLike) {
-        const target = ctrl!.kind === 'pid' ? ctrl!.target : (ctrl as { target: number }).target;
+        const target = activeTargets[ctrl!.id]
+          ?? (ctrl!.kind === 'pid' ? ctrl!.target : (ctrl as { target: number }).target);
         const err = ctrl!.kind === 'pid' ? o.pidErr : o.bbErr;
         const m = target - err;
         if (m < br.measMin) br.measMin = m;
@@ -385,14 +461,14 @@ export function createRun(sys: System, opts: RunOptions): Run {
         if (br.timeToTarget === null && Math.abs(err) <= band) br.timeToTarget = t;
 
         if (ctrl!.kind === 'pid') {
-          data[`${ctrl!.id}.setpoint`][i] = ctrl!.target;
+          data[`${ctrl!.id}.setpoint`][i] = target;
           data[`${ctrl!.id}.error`][i] = o.pidErr;
           data[`${ctrl!.id}.output`][i] = o.pidOut;
           data[`${ctrl!.id}.pTerm`][i] = o.pidP;
           data[`${ctrl!.id}.iTerm`][i] = o.pidI;
           data[`${ctrl!.id}.dTerm`][i] = o.pidD;
         } else {
-          data[`${ctrl!.id}.setpoint`][i] = ctrl!.target;
+          data[`${ctrl!.id}.setpoint`][i] = target;
           data[`${ctrl!.id}.error`][i] = o.bbErr;
           data[`${ctrl!.id}.output`][i] = o.bbOut;
         }
@@ -413,6 +489,14 @@ export function createRun(sys: System, opts: RunOptions): Run {
         data[`${ctrl.id}.feedforward`][i] = o.lqrFF;
         data[`${ctrl.id}.k1`][i] = mech.lqrGains.k1;
         data[`${ctrl.id}.k2`][i] = mech.lqrGains.k2;
+      } else if (ctrl && ctrl.kind === 'voltage') {
+        /* Commanded and applied are recorded separately on purpose: they are
+           equal right up until the command exceeds what the bus can deliver,
+           and the gap between the two traces is the clearest picture of
+           saturation this tool can draw. */
+        data[`${ctrl.id}.commanded`][i] = o.voltCmd;
+        data[`${ctrl.id}.applied`][i] = appliedVoltage;
+        data[`${ctrl.id}.output`][i] = o.D;
       }
 
       if (Math.abs(iTotal) > Math.abs(br.peakCurrent)) br.peakCurrent = iTotal;
@@ -426,6 +510,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
     data[`${sys.battery.id}.busVoltage`][i] = busVoltage;
     data[`${sys.battery.id}.totalCurrent`][i] = totalCurrent;
     if (busVoltage < minBusVoltage) minBusVoltage = busVoltage;
+    busPrev = busVoltage;
     if (Math.abs(totalCurrent) > Math.abs(peakTotalCurrent)) peakTotalCurrent = totalCurrent;
     i++;
   }
@@ -439,7 +524,15 @@ export function createRun(sys: System, opts: RunOptions): Run {
   const mechanisms: MechanismResult[] = branches.map((br, bi) => {
     const { mech } = br;
     const ctrl = mech.controller;
-    const targetForOvershoot = ctrl ? (ctrl.kind === 'lqr' ? ctrl.targetPos : ctrl.target) : 0;
+    /* A voltage block regulates nothing, so settle time, overshoot, and
+       steady-state error are not merely zero for it -- they are undefined.
+       Reporting them as null keeps the results strip honest rather than
+       showing a confident 0.00 next to an open-loop mechanism. */
+    const tracks = !!ctrl && ctrl.kind !== 'voltage';
+    const targetForOvershoot = !ctrl ? 0
+      : ctrl.kind === 'lqr' ? ctrl.targetPos
+      : ctrl.kind === 'voltage' ? 0
+      : ctrl.target;
     return {
       motorId: mech.motorBlock.id, solidId: mech.solid.id,
       controllerId: ctrl?.id ?? null,
@@ -447,13 +540,15 @@ export function createRun(sys: System, opts: RunOptions): Run {
       linearDisplay: mech.linearDisplay,
       peakCurrent: br.peakCurrent,
       timeToTarget: br.timeToTarget,
-      steadyStateError: ctrl ? br.lastErr : null,
-      overshoot: ctrl
+      steadyStateError: tracks ? br.lastErr : null,
+      overshoot: tracks
         ? (targetForOvershoot >= br.startMeas
             ? Math.max(0, br.measMax - targetForOvershoot)
             : Math.max(0, targetForOvershoot - br.measMin))
         : null,
       parentSolidId: mech.mountedOn,
+      parentOwnerSolidId: mech.mountedOnOwner ?? mech.mountedOn,
+      passiveChildIds: mech.passiveChildren.map((sb) => sb.id),
     };
   });
 

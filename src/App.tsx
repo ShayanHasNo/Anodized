@@ -14,6 +14,8 @@ import { nodeTypes, TYPE_COLOR } from './canvas/nodes';
 import { edgeTypes } from './canvas/edges';
 import { Inspector } from './Inspector';
 import { Library } from './Library';
+import { ActionsView, compileProgram, programDuration, type Program } from './ActionsView';
+import type { ResolvedStateGroup } from './sim/compile';
 import { serialize, deserialize, highestIdSuffix, downloadJson, filenameFor } from './persist';
 import { dimensionOf, conversionFactor, unitLabel } from './sim/units';
 import { MotionView, type MotionMech } from './motion/MotionView';
@@ -98,8 +100,12 @@ function makeBlock(kind: Block['kind']): Block {
         kind, id: nextId('lqr'), qPos: 40, qVel: 4, r: 1,
         targetPos: 75, targetVel: 0, gravityFeedforward: true,
       };
+    case 'voltage':
+      return { kind, id: nextId('volts'), volts: 6 };
     case 'joint':
       return { kind, id: nextId('joint'), jointType: 'revolute' };
+    case 'state':
+      return { kind, id: nextId('states'), label: 'States', states: [] };
   }
 }
 
@@ -167,7 +173,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [errorBlockId, setErrorBlockId] = useState<string | null>(null);
   const [showLibrary, setShowLibrary] = useState(false);
-  const [view, setView] = useState<'canvas' | 'graphs' | 'motion'>('canvas');
+  const [view, setView] = useState<'canvas' | 'graphs' | 'motion' | 'actions'>('canvas');
+  const [programs, setPrograms] = useState<Program[]>([]);
+  const [activeProgram, setActiveProgram] = useState<string | null>(null);
+  /* Resolved at compile time, so the Inspector and Actions tab both see the
+     controllers a state block can actually reach rather than guessing. */
+  const [stateGroups, setStateGroups] = useState<ResolvedStateGroup[]>([]);
   const [frame, setFrame] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -234,6 +245,14 @@ export default function App() {
     if (n.type === 'plotter') {
       return handleId === 'x' || handleId === 'y'
         ? { id: handleId, type: 'signal' as PortType, direction: 'in' as const }
+        : null;
+    }
+    /* A mechanism box carries no block, but it does expose one port: the tap a
+       state block attaches to. Without this branch the box has no ports at all
+       and portsFor() would be handed an undefined block. */
+    if (n.type === 'group') {
+      return handleId === 'mechanism'
+        ? { id: 'mechanism', type: 'signal' as PortType, direction: 'out' as const }
         : null;
     }
     const b = (n.data as { block: Block }).block;
@@ -442,18 +461,36 @@ export default function App() {
     [edges, plotterIds],
   );
 
+  /* Edges handed to the compiler. A mechanism box is not a block, but it IS a
+     legitimate edge SOURCE now that state blocks attach to boxes -- so the
+     filter keeps group-sourced edges instead of dropping them as dangling.
+     Every other compiler pass looks its endpoints up in the block map and
+     skips what it does not find, so the extra edges are inert everywhere but
+     the state-block resolution that wants them. */
+  const toSimEdges = useCallback((): SimEdge[] => {
+    const groupIds = new Set(groupNodes.map((g) => g.id));
+    return edges
+      .filter((e) => (blockById.has(e.source) || groupIds.has(e.source))
+        && blockById.has(e.target))
+      .map((e) => ({
+        from: { blockId: e.source, portId: e.sourceHandle ?? 'out' },
+        to: { blockId: e.target, portId: e.targetHandle ?? 'in' },
+      }));
+  }, [edges, blockById, groupNodes]);
+
   const run = useCallback(() => {
     try {
-      const simEdges: SimEdge[] = edges
-        .filter((e) => blockById.has(e.source) && blockById.has(e.target))
-        .map((e) => ({
-          from: { blockId: e.source, portId: e.sourceHandle ?? 'out' },
-          to: { blockId: e.target, portId: e.targetHandle ?? 'in' },
-        }));
+      const simEdges = toSimEdges();
       const sys = compile(blocks, simEdges, groups);
       // No global target any more: a controller block owns its own setpoint.
-      const r = simulate(sys, { duration });
+      const prog = programs.find((p) => p.id === activeProgram) ?? null;
+      const schedule = prog ? compileProgram(prog, sys.stateGroups) : undefined;
+      // A program needs enough runway to actually finish; pad past its last
+      // wait so the final state has time to settle.
+      const runFor = prog ? Math.max(duration, programDuration(prog) + 1) : duration;
+      const r = simulate(sys, { duration: runFor, schedule });
       setResult(r);
+      setStateGroups(sys.stateGroups);
       setFrame((f) => (f >= r.steps ? 0 : f));
       setError(null);
       setErrorBlockId(null);
@@ -472,7 +509,7 @@ export default function App() {
       setErrorBlockId(e instanceof CompileError ? e.blockId ?? null : null);
       setResult(null);
     }
-  }, [edges, blockById, blocks, duration, groups]);
+  }, [toSimEdges, blocks, duration, groups, programs, activeProgram]);
 
   /* Live tuning: re-run automatically a beat after anything changes, rather
      than making the person click Run after every field edit. Debounced so a
@@ -491,15 +528,20 @@ export default function App() {
     if (runMode !== 'live' || !liveRunning) return;
     let cancelled = false;
     try {
-      const simEdges: SimEdge[] = edges
-        .filter((e) => blockById.has(e.source) && blockById.has(e.target))
-        .map((e) => ({
-          from: { blockId: e.source, portId: e.sourceHandle ?? 'out' },
-          to: { blockId: e.target, portId: e.targetHandle ?? 'in' },
-        }));
-      const sys = compile(blocks, simEdges, groups);
-      const r = createRun(sys, { duration: 2 });
+      const sys = compile(blocks, toSimEdges(), groups);
+      /* The schedule has to be built here too, not just in the fixed-duration
+         path. A live run is the same solver stepping the same way -- the only
+         thing that differs is who decides when to stop -- so dropping the
+         program here meant the selected sequence silently did nothing in real
+         time: every controller sat on its own typed-in target, the mechanism
+         refused to move, and editing a setpoint by hand DID move it, which
+         makes it look like the state block is broken rather than the schedule
+         never having been handed over. */
+      const prog = programs.find((p) => p.id === activeProgram) ?? null;
+      const schedule = prog ? compileProgram(prog, sys.stateGroups) : undefined;
+      const r = createRun(sys, { duration: 2, schedule });
       liveRun.current = r;
+      setStateGroups(sys.stateGroups);
       setError(null);
       setErrorBlockId(null);
       setCompiled({
@@ -541,7 +583,7 @@ export default function App() {
       cancelled = true;
       if (liveRaf.current !== null) cancelAnimationFrame(liveRaf.current);
     };
-  }, [runMode, liveRunning, blocks, edges, blockById, groups]);
+  }, [runMode, liveRunning, blocks, toSimEdges, groups, programs, activeProgram]);
 
   /* Series are built per plotter, so each one gets its own independent pair of
      axes. Unit families are assigned to axes in the order they appear within
@@ -658,8 +700,27 @@ export default function App() {
         position: pos, toBase, positionUnit: posUnit,
         velocity: vel, velocityUnit: velUnit,
         setpoint, velocitySetpoint, posMin: lo, posMax: hi,
-        parentId: m.parentSolidId,
+        /* The POWERED carrier, not the immediate parent. A wrist bolted to the
+           top stage of a cascade names that stage as its parent, but the stage
+           has no mechanism of its own -- so grouping by it would leave the
+           wrist looking parentless and give it a card of its own, floating
+           beside the elevator instead of drawn riding on it. */
+        parentId: m.parentOwnerSolidId ?? m.parentSolidId,
         inheritsParentAngle,
+        passiveStages: m.passiveChildIds.map((pid) => {
+          const pdata = result.data[`${pid}.position`];
+          let plo = Infinity, phi = -Infinity;
+          if (pdata) for (let k = 0; k < pdata.length; k++) {
+            if (pdata[k] < plo) plo = pdata[k];
+            if (pdata[k] > phi) phi = pdata[k];
+          }
+          return {
+            id: pid,
+            position: pdata ?? new Float64Array(),
+            min: Number.isFinite(plo) ? plo : 0,
+            max: Number.isFinite(phi) ? phi : 0,
+          };
+        }),
       } as MotionMech;
     }).filter((x): x is MotionMech => x !== null);
   }, [result, blockById]);
@@ -760,7 +821,7 @@ export default function App() {
     setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, title } } : n)));
 
   const onSave = () => {
-    downloadJson(filenameFor(designName), serialize(nodes, edges, duration, designName));
+    downloadJson(filenameFor(designName), serialize(nodes, edges, duration, designName, programs));
   };
 
   const onLoadFile = async (file: File) => {
@@ -770,6 +831,14 @@ export default function App() {
       setEdges(parsed.edges);
       setDuration(parsed.duration);
       setDesignName(parsed.name);
+      const loadedPrograms = (parsed.programs as Program[]) ?? [];
+      setPrograms(loadedPrograms);
+      /* Select the first program rather than leaving the file loaded with none
+         active. A saved design that ships a program almost always means it to
+         run -- leaving it deselected reproduced the same confusing symptom as
+         the bug above, with the mechanism sitting still and no visible reason
+         why, since "No program" is easy to miss in the top bar. */
+      setActiveProgram(loadedPrograms[0]?.id ?? null);
       // Clear the id counter past everything in the file, or the next block
       // added would collide with one that was just loaded.
       bumpUid(highestIdSuffix(parsed.nodes));
@@ -829,6 +898,10 @@ export default function App() {
           </button>
           <button className={`tab${view === 'motion' ? ' on' : ''}`}
             onClick={() => setView('motion')}>Motion</button>
+          <button className={`tab${view === 'actions' ? ' on' : ''}`}
+            onClick={() => setView('actions')}>
+            Actions{programs.length ? ` (${programs.length})` : ''}
+          </button>
         </div>
         <button className="btn" onClick={onSave}>Save</button>
         <button className="btn" onClick={() => fileRef.current?.click()}>Load</button>
@@ -842,6 +915,19 @@ export default function App() {
           }}
         />
         <button className="btn" onClick={() => setShowLibrary(true)}>Library</button>
+        {programs.length > 0 && (
+          <select
+            value={activeProgram ?? ''}
+            onChange={(e) => setActiveProgram(e.target.value || null)}
+            style={{ width: 150 }}
+            title="Program to run"
+          >
+            <option value="">No program — states idle</option>
+            {programs.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        )}
         {runMode === 'fixed' ? (
           <>
             <span className="stat" style={{ color: 'var(--ink-3)' }}>auto</span>
@@ -877,6 +963,7 @@ export default function App() {
             ['gear', 'Gear', 'rotational'],
             ['solid', 'Solid', 'rotational'],
             ['joint', 'Joint', 'mount'],
+            ['state', 'States', 'signal'],
           ] as const).map(([kind, label, type]) => (
             <button key={kind} className="palette-item"
               style={{ ['--acc' as string]: TYPE_COLOR[type] }}
@@ -914,6 +1001,11 @@ export default function App() {
             style={{ ['--acc' as string]: TYPE_COLOR.control }}
             onClick={() => addBlock('lqr')}>
             LQR
+          </button>
+          <button className="palette-item"
+            style={{ ['--acc' as string]: TYPE_COLOR.control }}
+            onClick={() => addBlock('voltage')}>
+            Voltage
           </button>
 
           <h2 className="railhead">Run settings</h2>
@@ -970,6 +1062,9 @@ export default function App() {
               <Controls showInteractive={false} />
             </ReactFlow>
           </div>
+        ) : view === 'actions' ? (
+          <ActionsView programs={programs} groups={stateGroups}
+            activeId={activeProgram} onChange={setPrograms} onSelect={setActiveProgram} />
         ) : view === 'motion' ? (
           <div className="graphs-wrap">
             <MotionView mechs={motionMechs} time={result?.time ?? new Float64Array()}
@@ -1076,6 +1171,24 @@ export default function App() {
               controlled={motorIsControlled}
               sourceOptions={controllerSources}
               sourceUnit={controllerUnit}
+              stateControllers={
+                selectedBlock?.kind === 'state'
+                  ? (stateGroups.find((g) => g.blockId === selectedBlock.id)?.controllerIds ?? [])
+                      .map((cid) => {
+                        const grp = stateGroups.find((g) => g.blockId === selectedBlock.id)!;
+                        const ctrlBlock = blockById.get(cid);
+                        let unit = '';
+                        if (ctrlBlock?.kind === 'voltage') unit = 'V';
+                        else if (ctrlBlock?.kind === 'pid' || ctrlBlock?.kind === 'bangbang') {
+                          for (const b of blocks) {
+                            const ch = channelsFor(b).find((c) => c.key === ctrlBlock.source);
+                            if (ch) { unit = ch.unit; break; }
+                          }
+                        }
+                        return { id: cid, label: grp.controllerLabels[cid] ?? cid, unit };
+                      })
+                  : undefined
+              }
             />
           )}
         </aside>

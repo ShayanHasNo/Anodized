@@ -14,18 +14,22 @@ export interface SaveFile {
   app: 'anodized';
   savedAt: string;
   duration: number;
+  /** Action programs, opaque to persistence -- shape owned by ActionsView. */
+  programs: unknown[];
   nodes: Node[];
   edges: RFEdge[];
 }
 
 export function serialize(
   nodes: Node[], edges: RFEdge[], duration: number, name: string,
+  programs: unknown[] = [],
 ): string {
   const file: SaveFile = {
     version: SAVE_VERSION,
     app: 'anodized',
     name: name.trim() || 'Untitled design',
     savedAt: new Date().toISOString(),
+    programs,
     duration,
     // Strip React Flow's transient UI state -- selection, drag flags, and
     // measured sizes are re-derived on load and only bloat the file.
@@ -72,6 +76,7 @@ export function deserialize(text: string): SaveFile {
     name: typeof f.name === 'string' && f.name.trim() ? f.name : 'Untitled design',
     savedAt: f.savedAt ?? '',
     duration: typeof f.duration === 'number' ? f.duration : 1.5,
+    programs: Array.isArray(f.programs) ? f.programs : [],
     nodes: f.nodes,
     edges: f.edges,
   };

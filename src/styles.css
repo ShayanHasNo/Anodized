@@ -358,6 +358,14 @@ body {
   border-radius: 3px;
 }
 .mech-group.err .mech-group-tab { border-color: var(--danger); }
+/* Holds the box's single hex port inside the title tab. Relative positioning
+   is what lets the handle sit inline in the tab instead of being absolutely
+   placed against the box edge, where a resize would drag it around. */
+.group-port {
+  position: relative; display: inline-flex; align-items: center;
+  align-self: center; margin-left: 3px;
+}
+.mech-group-tab .react-flow__handle.xy-handle { pointer-events: all; }
 .mech-group-label {
   font-family: var(--cond); font-size: 11px; font-weight: 600;
   letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-2);
@@ -410,6 +418,20 @@ body {
   font-family: var(--cond); font-size: 13px; font-weight: 600;
   letter-spacing: 0.06em; color: var(--ink); margin: 0;
 }
+
+.state-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok);
+  border-radius: var(--r);
+  padding: 8px 10px 4px;
+  margin-bottom: 8px;
+  background: var(--panel-2);
+}
+.step-num {
+  font-size: 10px; color: var(--ink-3);
+  min-width: 16px; text-align: right;
+}
+.graphcard.active-prog { border-color: var(--ok); }
 
 /* ---------- motion ---------- */
 

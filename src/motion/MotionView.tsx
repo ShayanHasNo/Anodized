@@ -1,7 +1,7 @@
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from 'react';
 import {
   Archetype, ArmPose, ElevatorPose, FlywheelPose,
-  ArmWithChildPose, ElevatorWithChildPose,
+  ArmWithChildPose, ElevatorWithChildPose, stageColor,
   type ChildPose, type ElevatorStage,
 } from './archetypes';
 
@@ -26,6 +26,8 @@ export interface MotionMech {
   parentId: string | null;
   /** True when a revolute joint carries the parent's orientation into this one. */
   inheritsParentAngle: boolean;
+  /** Unpowered stages carried by this mechanism, already sampled per frame. */
+  passiveStages: { id: string; position: Float64Array; min: number; max: number }[];
 }
 
 const SPEEDS = [0.1, 0.25, 0.5, 1, 2];
@@ -126,37 +128,51 @@ export function MotionView({
   /**
    * An unbroken run of elevators chained together is a CASCADE -- stages that
    * ride on each other, so their heights add. Detected here rather than
-   * assumed, since an elevator carrying an arm is a different thing entirely
+   * assumed, since an elevator carrying an ARM is a different thing entirely
    * and must not be drawn as a telescoping stack.
+   *
+   * The run can END in something that is not an elevator, and that case is the
+   * common one on a real robot: a cascade with a wrist on the top carriage.
+   * That trailing mechanism comes back as `tail` and gets drawn ON the
+   * carriage. Refusing to recognise a cascade unless it was elevators all the
+   * way down -- which is what the previous check did -- meant exactly this
+   * layout fell back to the single-mast renderer, which drew only the bottom
+   * stage and hung the wrist off the side of it: the other three stages
+   * silently vanished, and the two mechanisms appeared at right angles to each
+   * other instead of one riding on top of the other.
    */
-  const cascadeStages = (m: MotionMech): ElevatorStage[] | null => {
+  const cascadeOf = (m: MotionMech): { stages: ElevatorStage[]; tail?: MotionMech } | null => {
     if (m.archetype !== 'elevator') return null;
     const stages: ElevatorStage[] = [];
-    let cur: MotionMech | undefined = m;
-    while (cur && cur.archetype === 'elevator') {
+    let cur: MotionMech = m;
+    let tail: MotionMech | undefined;
+
+    for (;;) {
       stages.push({
+        label: cur.label,
         position: cur.position[i] ?? 0,
         min: cur.posMin,
         max: cur.posMax,
         setpoint: cur.setpoint,
+        powered: true,
       });
+      // Unpowered stages carried by this one are cascade stages too -- a
+      // single-motor cascade is exactly this shape: one powered stage plus
+      // however many rigged stages riding on it.
+      for (const ps of cur.passiveStages) {
+        stages.push({
+          label: ps.id, position: ps.position[i] ?? 0,
+          min: ps.min, max: ps.max, setpoint: null, powered: false,
+        });
+      }
       const next: MotionMech | undefined = childrenOf.get(cur.id)?.[0];
-      // Stop at the first non-elevator: that chain continues, but not as a
-      // cascade, so it belongs to the carrying renderer instead.
-      if (!next || next.archetype !== 'elevator') return stages.length ? stages : null;
+      if (!next) break;
+      // Stop at the first non-elevator: that chain continues, but as something
+      // riding on the carriage rather than as another telescoping stage.
+      if (next.archetype !== 'elevator') { tail = next; break; }
       cur = next;
     }
-    return stages.length ? stages : null;
-  };
-
-  /** True when the whole embedded chain below m is elevators all the way down. */
-  const isPureCascade = (m: MotionMech): boolean => {
-    let cur: MotionMech | undefined = m;
-    while (cur) {
-      if (cur.archetype !== 'elevator') return false;
-      cur = childrenOf.get(cur.id)?.[0];
-    }
-    return true;
+    return stages.length ? { stages, tail } : null;
   };
 
   /** Flattened labels of an embedded chain, for the card title. */
@@ -214,20 +230,27 @@ export function MotionView({
           const childPose: ChildPose | null = firstChild ? buildChain(firstChild) : null;
           const labels = firstChild ? chainLabels(m) : [m.label];
 
-          const cascade = isPureCascade(m) ? cascadeStages(m) : null;
+          /* A cascade is drawn as one nested stack, so it takes over the card
+             from the generic chain renderers -- but only when there is
+             actually more than one stage to nest. A lone elevator carrying a
+             wrist still reads better as a single mast with the wrist beside
+             it. */
+          const casc = cascadeOf(m);
+          const cascade = casc && casc.stages.length > 1 ? casc : null;
+          const cascadeChild = cascade?.tail ? buildChain(cascade.tail) : undefined;
 
           return (
             <section className="motion-card" key={m.id}>
               <div className="motion-head">
                 <h3 className="graphcard-title">{labels.join(' + ')}</h3>
                 <span className="node-id">
-                  {cascade && cascade.length > 1
-                    ? `${cascade.length}-stage cascade`
+                  {cascade
+                    ? `${cascade.stages.length}-stage cascade${cascade.tail ? ` + ${cascade.tail.label}` : ''}`
                     : labels.length > 1 ? `${labels.length}-link chain` : m.archetype}
                 </span>
               </div>
               <div className="motion-stage">
-                {cascade && <ElevatorPose stages={cascade} />}
+                {cascade && <ElevatorPose stages={cascade.stages} child={cascadeChild} />}
                 {!cascade && childPose && m.archetype === 'arm' && (
                   <ArmWithChildPose angle={base}
                     setpoint={m.setpoint === null ? null : m.setpoint * m.toBase}
@@ -243,6 +266,23 @@ export function MotionView({
                 )}
                 {m.archetype === 'flywheel' && <FlywheelPose angle={base} />}
               </div>
+              {/* Colour is the only thing telling the stages apart in the
+                  drawing, so it needs a key -- otherwise the reader can see
+                  that there are four parts but not which is which. */}
+              {cascade && (
+                <div className="motion-readout" style={{ flexWrap: 'wrap', rowGap: 4 }}>
+                  {cascade.stages.map((st, si) => (
+                    <span className="stat" key={`${st.label}-${si}`}>
+                      <span className="swatch"
+                        style={{
+                          background: stageColor(si).fill,
+                          height: 9, width: 9, flexBasis: 9, borderRadius: 2,
+                        }} />
+                      {st.label}{st.powered ? '' : ' (rigged)'}
+                    </span>
+                  ))}
+                </div>
+              )}
               <div className="motion-readout">
                 <span className="stat">
                   pos <b className="num">{fmt(pos)}</b> {m.positionUnit}

@@ -26,7 +26,7 @@ function Num({
 }
 
 export function Inspector({
-  block, onChange, onDelete, controlled, sourceOptions, sourceUnit,
+  block, onChange, onDelete, controlled, sourceOptions, sourceUnit, stateControllers,
 }: {
   block: Block | null;
   onChange: (b: Block) => void;
@@ -36,6 +36,8 @@ export function Inspector({
   /** Channels wired into a PID's hex input, offered as error sources. */
   sourceOptions?: { key: string; label: string }[];
   sourceUnit?: string;
+  /** Controllers a selected state block can command, discovered at compile. */
+  stateControllers?: { id: string; label: string; unit: string }[];
 }) {
   if (!block) {
     return (
@@ -388,6 +390,24 @@ export function Inspector({
         </>
       )}
 
+      {block.kind === 'voltage' && (
+        <>
+          <Num label="Commanded voltage (V)" value={block.volts} step={0.5}
+            onChange={(v) => set('volts', v)}
+            hint="Signed — negative drives the other way. A state block can set this the same as any other controller target." />
+          <div className="hint" style={{ marginBottom: 11 }}>
+            Open loop: nothing is measured, so there is no error, no gains, and
+            no setpoint to settle on. Each step the commanded volts are divided
+            by the live bus voltage to get a duty, so the mechanism holds the
+            same voltage as the battery sags instead of quietly getting weaker
+            — which is the difference between this and typing a duty into the
+            motor block. Ask for more than the bus can give and it saturates at
+            full duty; the block’s two voltage channels diverge exactly when
+            that happens.
+          </div>
+        </>
+      )}
+
       {block.kind === 'joint' && (
         <>
           <div className="field">
@@ -410,6 +430,70 @@ export function Inspector({
           </div>
         </>
       )}
+
+      {block.kind === 'state' && (() => {
+        const ctrls = stateControllers ?? [];
+        const setStates = (states: typeof block.states) =>
+          onChange({ ...block, states } as Block);
+        return (
+          <>
+            <div className="field">
+              <label>Label</label>
+              <input type="text" value={block.label}
+                onChange={(e) => onChange({ ...block, label: e.target.value } as Block)} />
+            </div>
+
+            {ctrls.length === 0 ? (
+              <div className="hint" style={{ marginBottom: 11 }}>
+                No controllers found yet. Wire this block&rsquo;s input to a
+                mechanism box&rsquo;s hex port — the small hexagon on the
+                box&rsquo;s name tab — then run once so the graph compiles.
+                Every controller in that box, and on anything jointed onto it,
+                shows up here.
+              </div>
+            ) : (
+              <div className="hint" style={{ marginBottom: 11 }}>
+                Commands {ctrls.length} controller{ctrls.length === 1 ? '' : 's'}:{' '}
+                {ctrls.map((c) => c.label).join(', ')}.
+              </div>
+            )}
+
+            {block.states.map((st, si) => (
+              <div key={si} className="state-card">
+                <div className="channel-row">
+                  <input type="text" value={st.name} placeholder="State name"
+                    onChange={(e) => setStates(block.states.map((x, k) =>
+                      (k === si ? { ...x, name: e.target.value } : x)))} />
+                  <button className="iconbtn" aria-label="Remove state"
+                    onClick={() => setStates(block.states.filter((_, k) => k !== si))}>×</button>
+                </div>
+                {ctrls.map((c) => (
+                  <div className="field" key={c.id} style={{ marginBottom: 6 }}>
+                    <label>{c.label}{c.unit ? ` (${c.unit})` : ''}</label>
+                    <input type="number" step={5}
+                      value={st.targets[c.id] ?? 0}
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        setStates(block.states.map((x, k) => (k === si
+                          ? { ...x, targets: { ...x.targets, [c.id]: Number.isNaN(v) ? 0 : v } }
+                          : x)));
+                      }} />
+                  </div>
+                ))}
+              </div>
+            ))}
+
+            <button className="btn" style={{ width: '100%', marginBottom: 8 }}
+              disabled={ctrls.length === 0}
+              onClick={() => setStates([...block.states, {
+                name: `State ${block.states.length + 1}`,
+                targets: Object.fromEntries(ctrls.map((c) => [c.id, 0])),
+              }])}>
+              Add state
+            </button>
+          </>
+        );
+      })()}
 
       <button className="btn" style={{ width: '100%', marginTop: 6 }} onClick={onDelete}>
         Remove block
