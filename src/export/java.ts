@@ -3,30 +3,44 @@
  *
  * The generated code is STATE-BASED, not command-based. Each subsystem owns an
  * enum of goals and a `setGoal`; `periodic()` drives whatever the current goal
- * says. There are no Command classes, no `SubsystemBase`, and no imports from
- * `edu.wpi.first.wpilibj2.command` anywhere in the output -- a superstructure
- * asks "what state am I in, and what does that state want?" every loop, rather
- * than scheduling objects that own the mechanism for a while. That makes the
- * mechanism's behaviour a pure function of its state, which is exactly the
- * shape this simulator already models.
+ * says. No `Command` factories, no `Commands.run(...)`, nothing that takes
+ * ownership of the mechanism for a while -- the subsystem asks "what state am
+ * I in, and what does that state want?" every loop. That makes behaviour a
+ * pure function of state, which is the shape this simulator already models.
  *
- * The AdvantageKit split is the standard three files per mechanism:
+ * Subsystems DO extend `SubsystemBase`, which is not a contradiction. Extending
+ * it buys scheduler-driven `periodic()`, `AdvantageScope`/`Shuffleboard`
+ * registration, and the requirements plumbing that the rest of a WPILib robot
+ * expects to exist -- none of which forces a command-based control flow. The
+ * command-vs-state distinction is about HOW behaviour is expressed, not about
+ * which base class a subsystem happens to have.
  *
+ * FIVE FILES PER MECHANISM, matching the layout of a real robot project:
+ *
+ *   <Name>Constants.java   gains, goal positions, conversions, hardware ids
  *   <Name>IO.java          the hardware boundary -- inputs struct + setters
  *   <Name>IOPhysical.java  real motor controllers and sensors, configured
- *   <Name>.java            hardware-independent logic: goals and control
+ *   <Name>IOSim.java       a WPILib plant seeded from the simulated mechanism
+ *   <Name>.java            goals and control, hardware-independent
  *
- * plus a <Name>IOSim.java, because this tool already knows the plant exactly
- * (gearing, inertia, mass, drum radius), so seeding a WPILib physics sim with
- * those numbers is free and gives the generated code something to run against
- * before the mechanism is built.
+ * Constants live in their own file rather than inline because they are the
+ * things a person actually edits at the field: gains get retuned, setpoints get
+ * nudged, a CAN id changes when a controller is swapped. Keeping them in one
+ * `static import`-able place means none of that requires touching logic, and it
+ * is where a team's tunable-number plumbing drops in if they have it.
  *
- * A NOTE ON WHAT THIS CANNOT KNOW: CAN ids, inversion, sensor phase, and
- * soft limits are not physics, so the simulator has no opinion about them.
- * They come out as named constants with TODO markers rather than plausible
- * guesses -- a wrong CAN id that looks deliberate is worse than an obvious
- * blank. Gains are translated from the simulated tune and marked as a starting
- * point, since a simulated plant is never the real one.
+ * The IO split follows the same two-call shape a real implementation converges
+ * on: `setPosition` records the target, `goToSetpoint` acts on it. Separating
+ * them lets the hardware layer own what happens between deciding and doing --
+ * homing before it trusts its encoder, refusing to move while uncalibrated --
+ * without the subsystem knowing any of it.
+ *
+ * A NOTE ON WHAT THIS CANNOT KNOW: CAN ids, inversion, sensor phase, and soft
+ * limits are not physics, so the simulator has no opinion about them. They come
+ * out as named constants with TODO markers rather than plausible guesses -- a
+ * wrong CAN id that looks deliberate is worse than an obvious blank. Gains are
+ * translated from the simulated tune and marked as a starting point, since a
+ * simulated plant is never the real one.
  */
 
 import { System, Mechanism, MechanismGroup, ResolvedStateGroup } from '../sim/compile';
@@ -238,8 +252,130 @@ export type { Vendor };
 
 const BASE_PKG = 'frc.robot.subsystems';
 
+/** SCREAMING_SNAKE constant name for a goal's setpoint in the Constants file. */
+const goalConstant = (p: SubsystemPlan, goalName: string) =>
+  `${goalName}_${p.mode === 'voltage' ? 'VOLTS' : p.mode === 'velocity' ? 'VELOCITY' : 'POSITION'}`;
+
+/* --- constants ------------------------------------------------------------ */
+
+function constantsFile(p: SubsystemPlan): string {
+  const N = p.className;
+  const m = p.mech;
+  const g = gainsFor(m);
+  const vendor = vendorFor(m.motorBlock.motorId);
+  const unit = p.mode === 'voltage' ? 'volts' : p.mode === 'velocity' ? p.velUnit : p.posUnit;
+
+  const goalConsts = p.goals.map((goal) =>
+    `  /** "${goal.from}" — ${num(goal.value)} ${unit}. */\n`
+    + `  public static final double ${goalConstant(p, goal.name)} = ${num(goal.value)};`,
+  ).join('\n');
+
+  const conversionComment = m.linearDisplay
+    ? `   * One output rotation pays out 2*pi*r = ${num(2 * Math.PI * (m.radius ?? 0), 6)} m of cable,\n`
+      + `   * and the rotor turns ${num(m.ratio, 4)} times per output rotation.`
+    : `   * One output rotation is 2*pi rad, and the rotor turns ${num(m.ratio, 4)} times\n`
+      + `   * per output rotation.`;
+
+  return `package ${BASE_PKG}.${p.pkg};
+
+/**
+ * Tuning and hardware constants for ${N}.
+ *
+ * Everything here is something a person edits without touching logic: gains get
+ * retuned, setpoints get nudged between matches, a CAN id changes when a
+ * controller is swapped. Values the simulator derived are filled in; values it
+ * cannot know are marked TODO.
+ *
+ * If your project has tunable-number plumbing, this is where it goes — swap the
+ * gain fields for tunables and nothing else in the mechanism has to change.
+ *
+ * Generated by Anodized. Safe to edit.
+ */
+public final class ${N}Constants {
+  private ${N}Constants() {}
+
+  /* ---- hardware ---- */
+
+  // TODO: set the real CAN id${m.motorBlock.count > 1 ? 's' : ''}.
+  public static final int MOTOR_CAN_ID = 0;${m.motorBlock.count > 1
+    ? `\n  public static final int[] FOLLOWER_CAN_IDS = new int[] {${
+      Array.from({ length: m.motorBlock.count - 1 }, () => '0').join(', ')}};`
+    : ''}${vendor === 'talonfx' ? '\n  public static final String CAN_BUS = "rio";' : ''}
+
+  // TODO: confirm against the real mechanism — positive should move it the same
+  // way positive moves it in the simulator.
+  public static final boolean INVERTED = false;
+
+  /** Per-motor current limit, from the simulated mechanism. */
+  public static final int CURRENT_LIMIT_AMPS = ${Math.round(m.motorBlock.currentLimit)};
+
+  /* ---- conversion ---- */
+
+  /**
+   * ${p.posUnit} of mechanism travel per ROTOR rotation.
+   *
+${conversionComment}
+   *
+   * Applied to the encoder so every reading is already in ${p.posUnit} — the
+   * subsystem, the gains, and the setpoints then share one unit and nothing has
+   * to remember to convert.
+   */
+  public static final double ENCODER_CONVERSION_FACTOR = ${num(p.unitsPerMotorRotation, 8)};
+${p.archetype === 'arm' ? `
+  /**
+   * Radians per ${p.posUnit}. ArmFeedforward needs the angle in radians to work out
+   * the gravity load, no matter what unit the rest of the mechanism uses.
+   */
+  public static final double RADIANS_PER_UNIT = ${num(UNITS[p.posUnit]?.toBase ?? 1, 8)};
+` : ''}
+
+  /* ---- gains ----
+     Translated from the simulated tune: the simulator works in duty per unit of
+     error and these output volts, so each is scaled by a nominal ${num(NOMINAL_VOLTS, 1)} V bus.
+
+     TREAT THESE AS A STARTING POINT. They were tuned against a rigid,
+     backlash-free, noise-free model of this mechanism. Real friction, real
+     compliance, and real sensor noise are not in that model. */
+
+  public static final double KP = ${num(g.kP)};
+  public static final double KI = ${num(g.kI)};
+  public static final double KD = ${num(g.kD)};
+  /** Gravity feedforward, from the simulated kF. */
+  public static final double KG = ${num(g.kG)};
+  /** Static friction — not modelled by the simulator, so it starts at zero. */
+  public static final double KS = 0.0;
+  /** Velocity feedforward — not modelled by the simulator, so it starts at zero. */
+  public static final double KV = 0.0;
+
+  /* ---- motion limits ----
+     Infinity means no motion profile: the controller drives straight at the
+     setpoint, which is what the simulation modelled. Set real numbers here to
+     profile the approach, and expect to retune KP when you do. */
+
+  public static final double MAX_VELOCITY = Double.POSITIVE_INFINITY;
+  public static final double MAX_ACCELERATION = Double.POSITIVE_INFINITY;
+
+  // TODO: set to the mechanism's real range of travel. The simulator has no
+  // hard stops, so it cannot infer these.
+  public static final double FORWARD_SOFT_LIMIT = 0.0;
+  public static final double REVERSE_SOFT_LIMIT = 0.0;
+  public static final boolean SOFT_LIMITS_ENABLED = false;
+
+  /* ---- setpoints ---- */
+
+  /** How close counts as "there", in ${unit}. TODO: tune on the robot. */
+  public static final double TOLERANCE = ${num(toleranceFor(p))};
+
+${goalConsts}
+}
+`;
+}
+
+/* --- IO interface --------------------------------------------------------- */
+
 function ioFile(p: SubsystemPlan): string {
   const N = p.className;
+
   return `package ${BASE_PKG}.${p.pkg};
 
 import org.littletonrobotics.junction.AutoLog;
@@ -247,16 +383,16 @@ import org.littletonrobotics.junction.AutoLog;
 /**
  * Hardware boundary for the ${N} mechanism.
  *
- * Everything the subsystem can observe is an input; everything it can command
- * is a method. Nothing in this file knows what a motor controller is, which is
- * what lets ${N} run identically against real hardware, a physics sim, or a
- * replayed log.
+ * Deliberately dumb: it reports what the sensors say and applies the volts it
+ * is told to apply. It runs no control loop of its own. The feedback lives in
+ * ${N} so that the state machine, the gains, and the setpoints are all readable
+ * in one file instead of split between here and a motor controller's flash.
  *
  * Generated by Anodized from the simulated mechanism. Safe to edit.
  */
 public interface ${N}IO {
   @AutoLog
-  public static class ${N}IOInputs {
+  class ${N}IOInputs {
     /** False when the motor controller has stopped answering. */
     public boolean connected = false;
 
@@ -264,130 +400,277 @@ public interface ${N}IO {
     public double velocity${p.velSuffix} = 0.0;
 
     public double appliedVolts = 0.0;
-    /** One entry per motor on the shaft (${p.mech.motorBlock.count} here). */
-    public double[] statorCurrentAmps = new double[] {};
-    public double[] supplyCurrentAmps = new double[] {};
-    public double[] tempCelsius = new double[] {};
+    public double currentAmps = 0.0;
   }
 
-  /** Reads every input from hardware. Called once per loop, before logic. */
-  public default void updateInputs(${N}IOInputs inputs) {}
+  default void updateInputs(${N}IOInputs inputs) {}
 
-  /** Closed-loop position request, in ${p.posUnit}. */
-  public default void setPositionSetpoint(double position${p.posSuffix}) {}
+  /** The one way to command this mechanism. */
+  default void setVoltage(double volts) {}
 
-  /** Closed-loop velocity request, in ${p.velUnit}. */
-  public default void setVelocitySetpoint(double velocity${p.velSuffix}) {}
+  default void stop() {}
 
-  /** Open-loop voltage request. */
-  public default void setVoltage(double volts) {}
+  default void setBrakeMode(boolean enabled) {}
 
-  /** Neutral output. */
-  public default void stop() {}
-
-  public default void setBrakeMode(boolean enabled) {}
-
-  /** Teaches the controller where the mechanism currently is. */
-  public default void setPosition(double position${p.posSuffix}) {}
+  /** Teaches the encoder where the mechanism currently is. */
+  default void resetPosition(double position${p.posSuffix}) {}
 }
 `;
 }
 
+/* --- subsystem ------------------------------------------------------------ */
+
 function subsystemFile(p: SubsystemPlan): string {
   const N = p.className;
-  const setpointUnit = p.mode === 'velocity' ? p.velUnit
-    : p.mode === 'voltage' ? 'volts' : p.posUnit;
-  const setpointSuffix = p.mode === 'velocity' ? p.velSuffix
-    : p.mode === 'voltage' ? 'Volts' : p.posSuffix;
-  const measured = p.mode === 'velocity'
+  const closedLoop = p.mode !== 'voltage';
+  const velocityMode = p.mode === 'velocity';
+  const measured = velocityMode
     ? `inputs.velocity${p.velSuffix}` : `inputs.position${p.posSuffix}`;
 
-  const goalLines = p.goals
-    .map((g) => `    /** From the "${g.from}" state. */\n    ${g.name}(${num(g.value)})`)
-    .join(',\n');
+  /* THE STATE MACHINE.
+     Each case RUNS its state -- it calls the routine that drives the mechanism,
+     rather than setting a variable that something further down acts on. That
+     way the case body is the behaviour: a state that needs to do something
+     different (hold instead of drive, run a second setpoint, home first) has
+     the obvious place to say so, and reading one case tells you everything that
+     state does.
 
-  const applyLine = p.mode === 'voltage'
-    ? `io.setVoltage(goal.getSetpoint${setpointSuffix}());`
-    : p.mode === 'velocity'
-      ? `io.setVelocitySetpoint(goal.getSetpoint${setpointSuffix}());`
-      : `io.setPositionSetpoint(goal.getSetpoint${setpointSuffix}());`;
+     A switch rather than values hung off the enum, because an enum constructor
+     argument can only ever be a number. The compiler also points straight at
+     this switch the moment a state is added and left unhandled. */
+  const cases = p.goals.map((g) =>
+    `      case ${g.name} -> ${closedLoop ? 'runSetpoint' : 'runVolts'}(${goalConstant(p, g.name)});`,
+  ).join('\n');
 
-  const atGoalBody = p.mode === 'voltage'
-    ? `    // Open loop: there is no measurement being regulated, so "at goal"
-    // only means the request has been issued. Reporting a tolerance check
-    // here would invent a closed loop that does not exist.
-    return true;`
-    : `    return Math.abs(${measured} - goal.getSetpoint${setpointSuffix}()) <= TOLERANCE;`;
+  const stateNames = p.goals.map((g) => g.name).join(', ');
 
-  return `package ${BASE_PKG}.${p.pkg};
+  const feedforward = p.archetype === 'arm'
+    ? `  /* Arm gravity load varies with angle, so the feedforward needs the angle --
+     hence ArmFeedforward rather than the simpler Elevator form. It wants
+     radians regardless of the unit the rest of this file works in. */
+  private final ArmFeedforward feedforward = new ArmFeedforward(KS, KG, KV);`
+    : p.archetype === 'elevator'
+      ? `  /* Elevator gravity load is constant, so KG is a flat volts offset. */
+  private final ElevatorFeedforward feedforward = new ElevatorFeedforward(KS, KG, KV);`
+      : `  private final SimpleMotorFeedforward feedforward = new SimpleMotorFeedforward(KS, KV);`;
 
+  const ffCall = p.archetype === 'arm'
+    ? `feedforward.calculate(inputs.position${p.posSuffix} * RADIANS_PER_UNIT, 0.0)`
+    : p.archetype === 'elevator'
+      ? 'feedforward.calculate(0.0)'
+      : `feedforward.calculate(${velocityMode ? 'setpoint' : '0.0'})`;
+
+  const ffImport = p.archetype === 'arm'
+    ? 'import edu.wpi.first.math.controller.ArmFeedforward;'
+    : p.archetype === 'elevator'
+      ? 'import edu.wpi.first.math.controller.ElevatorFeedforward;'
+      : 'import edu.wpi.first.math.controller.SimpleMotorFeedforward;';
+
+  if (!closedLoop) {
+    // Open loop: the state picks a voltage and that voltage is applied. No
+    // controller, because there is no measurement being regulated.
+    return `package ${BASE_PKG}.${p.pkg};
+
+import static ${BASE_PKG}.${p.pkg}.${N}Constants.*;
+
+import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.wpilibj2.command.SubsystemBase;
+import org.littletonrobotics.junction.AutoLogOutput;
 import org.littletonrobotics.junction.Logger;
 
 /**
- * ${N} -- a STATE-BASED subsystem.
+ * ${N} — a STATE-BASED subsystem.
  *
- * The mechanism is always in exactly one {@link Goal}, and {@link #periodic()}
- * drives toward whatever that goal asks for, every loop, unconditionally.
- * Changing what the mechanism does means changing its goal; nothing takes
- * ownership of it, and there is no queue of pending work. That is the whole
- * difference from a command-based subsystem, and it is why a mechanism can
- * never be left in a state nobody asked for because a command ended early.
+ * The mechanism is always in exactly one {@link State}, and {@link #periodic()}
+ * executes that state every loop. Changing what the mechanism does means
+ * changing its state; nothing takes ownership of it and there is no queue of
+ * pending work, so it can never be left holding a state nobody asked for.
  *
- * Call {@link #periodic()} from Robot.robotPeriodic() once per loop.
+ * This one runs OPEN LOOP: each state names a voltage, and that voltage is
+ * applied. There is no controller because there is no measurement being
+ * regulated — a roller either spins or it does not.
  *
  * Generated by Anodized from the simulated mechanism. Safe to edit.
  */
-public class ${N} {
-  /** Every state this mechanism can be asked to hold. */
-  public enum Goal {
-${goalLines};
-
-    private final double setpoint;
-
-    Goal(double setpoint) {
-      this.setpoint = setpoint;
-    }
-
-    /** Setpoint for this goal, in ${setpointUnit}. */
-    public double getSetpoint${setpointSuffix}() {
-      return setpoint;
-    }
+public class ${N} extends SubsystemBase {
+  /** Every state this mechanism can be in: ${stateNames}. */
+  public enum State {
+${p.goals.map((g) => `    /** From the "${g.from}" state. */\n    ${g.name}`).join(',\n')}
   }
-
-  /** How close counts as "there", in ${setpointUnit}. TODO: tune on the robot. */
-  private static final double TOLERANCE = ${num(toleranceFor(p))};
 
   private final ${N}IO io;
   private final ${N}IOInputsAutoLogged inputs = new ${N}IOInputsAutoLogged();
 
-  private Goal goal = Goal.${p.goals[0].name};
+  /**
+   * The state this mechanism is in. Public so anything can read it without
+   * going through an accessor — a superstructure deciding whether it is safe to
+   * move, a dashboard, an auto routine checking where things stand.
+   *
+   * Prefer {@link #setState} for writes: it is the same assignment, but it is
+   * greppable, so every place that changes this mechanism's behaviour can be
+   * found.
+   */
+  @AutoLogOutput public State state = State.${p.goals[0].name};
+
+  /** Volts the running state last asked for. */
+  @AutoLogOutput private double appliedVolts = 0.0;
 
   public ${N}(${N}IO io) {
     this.io = io;
   }
 
+  @Override
   public void periodic() {
     io.updateInputs(inputs);
     Logger.processInputs("${N}", inputs);
 
-    ${applyLine}
-
-    Logger.recordOutput("${N}/Goal", goal);
-    Logger.recordOutput("${N}/Setpoint", goal.getSetpoint${setpointSuffix}());
-    Logger.recordOutput("${N}/AtGoal", atGoal());
+    // Run the current state.
+    switch (state) {
+${cases}
+    }
   }
 
-  /** Asks the mechanism to hold a different state. Takes effect next loop. */
-  public void setGoal(Goal goal) {
-    this.goal = goal;
+  /** Drives the mechanism at a fixed voltage. What every state here does. */
+  private void runVolts(double volts) {
+    appliedVolts = MathUtil.clamp(volts, -12.0, 12.0);
+    io.setVoltage(appliedVolts);
   }
 
-  public Goal getGoal() {
-    return goal;
+  public void setState(State state) {
+    this.state = state;
   }
 
-  public boolean atGoal() {
-${atGoalBody}
+  public State getState() {
+    return state;
+  }
+
+  /**
+   * Open loop, so there is nothing to converge on — the request is either
+   * issued or it is not. Reporting a tolerance check would invent a closed loop
+   * that does not exist.
+   */
+  public boolean atState() {
+    return true;
+  }
+
+  public double getVelocity${p.velSuffix}() {
+    return inputs.velocity${p.velSuffix};
+  }
+
+  public boolean isConnected() {
+    return inputs.connected;
+  }
+
+  /** Cuts output. The next {@link #periodic()} resumes running the state. */
+  public void stop() {
+    appliedVolts = 0.0;
+    io.stop();
+  }
+}
+`;
+  }
+
+  return `package ${BASE_PKG}.${p.pkg};
+
+import static ${BASE_PKG}.${p.pkg}.${N}Constants.*;
+
+import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.math.controller.PIDController;
+${ffImport}
+import edu.wpi.first.wpilibj2.command.SubsystemBase;
+import org.littletonrobotics.junction.AutoLogOutput;
+import org.littletonrobotics.junction.Logger;
+
+/**
+ * ${N} — a STATE-BASED subsystem.
+ *
+ * The mechanism is always in exactly one {@link State}, and {@link #periodic()}
+ * executes that state every loop, unconditionally. Changing what the mechanism
+ * does means changing its state; nothing takes ownership of it and there is no
+ * queue of pending work, so it can never be left holding a state nobody asked
+ * for because a command ended early.
+ *
+ * The feedback loop lives HERE rather than on the motor controller. That costs
+ * some loop rate — the controller could close at 1 kHz internally, this closes
+ * at the 50 Hz robot loop — and buys the thing that matters more while a
+ * mechanism is being brought up: the gains, the setpoint, and the state that
+ * chose it are all visible in one file and all logged, instead of being split
+ * between this file and a value burned into the controller's flash. Move it
+ * onboard once the mechanism is tuned and the gains have stopped changing.
+ *
+ * Generated by Anodized from the simulated mechanism. Safe to edit.
+ */
+public class ${N} extends SubsystemBase {
+  /** Every state this mechanism can be in: ${stateNames}. */
+  public enum State {
+${p.goals.map((g) => `    /** From the "${g.from}" state. */\n    ${g.name}`).join(',\n')}
+  }
+
+  private final ${N}IO io;
+  private final ${N}IOInputsAutoLogged inputs = new ${N}IOInputsAutoLogged();
+
+  private final PIDController controller = new PIDController(KP, KI, KD);
+${feedforward}
+
+  /**
+   * The state this mechanism is in. Public so anything can read it without
+   * going through an accessor — a superstructure deciding whether it is safe to
+   * move, a dashboard, an auto routine checking where things stand.
+   *
+   * Prefer {@link #setState} for writes: it is the same assignment, but it is
+   * greppable, so every place that changes this mechanism's behaviour can be
+   * found.
+   */
+  @AutoLogOutput public State state = State.${p.goals[0].name};
+
+  /** What the running state is asking for, in ${velocityMode ? p.velUnit : p.posUnit}. */
+  @AutoLogOutput private double setpoint = ${goalConstant(p, p.goals[0].name)};
+
+  public ${N}(${N}IO io) {
+    this.io = io;
+    controller.setTolerance(TOLERANCE);
+  }
+
+  @Override
+  public void periodic() {
+    io.updateInputs(inputs);
+    Logger.processInputs("${N}", inputs);
+
+    // Run the current state.
+    switch (state) {
+${cases}
+    }
+
+    Logger.recordOutput("${N}/Error", controller.getError());
+    Logger.recordOutput("${N}/AtState", atState());
+  }
+
+  /**
+   * Closes the loop on a setpoint, in ${velocityMode ? p.velUnit : p.posUnit}. What every state here does.
+   *
+   * Lives in one place rather than being spelled out per case so that the
+   * control math cannot drift between states — a state that needs to do
+   * something genuinely different calls something else instead.
+   */
+  private void runSetpoint(double setpoint) {
+    this.setpoint = setpoint;
+    controller.setSetpoint(setpoint);
+    double volts = controller.calculate(${measured}) + ${ffCall};
+    io.setVoltage(MathUtil.clamp(volts, -12.0, 12.0));
+  }
+
+  /** Asks the mechanism to hold a state. Takes effect on the next loop. */
+  public void setState(State state) {
+    this.state = state;
+  }
+
+  public State getState() {
+    return state;
+  }
+
+  /** True once the measurement is inside TOLERANCE of the state's setpoint. */
+  public boolean atState() {
+    return controller.atSetpoint();
   }
 
   public double getPosition${p.posSuffix}() {
@@ -398,11 +681,12 @@ ${atGoalBody}
     return inputs.velocity${p.velSuffix};
   }
 
-  /** True when the hardware has stopped reporting -- worth surfacing to drivers. */
+  /** True when the hardware has stopped reporting — worth surfacing to drivers. */
   public boolean isConnected() {
     return inputs.connected;
   }
 
+  /** Cuts output. The next {@link #periodic()} resumes driving the state. */
   public void stop() {
     io.stop();
   }
@@ -410,7 +694,6 @@ ${atGoalBody}
 `;
 }
 
-/** A tolerance that is meaningful in the mechanism's own units. */
 function toleranceFor(p: SubsystemPlan): number {
   if (p.mode === 'voltage') return 0;
   const span = p.goals.reduce((max, g) => Math.max(max, Math.abs(g.value)), 0);
@@ -421,74 +704,51 @@ function toleranceFor(p: SubsystemPlan): number {
   return Math.max(span * 0.02, floor);
 }
 
+/* --- hardware layer ------------------------------------------------------- */
+
 function physicalFile(p: SubsystemPlan): string {
   const N = p.className;
   const m = p.mech;
   const vendor = vendorFor(m.motorBlock.motorId);
-  const g = gainsFor(m);
-  const count = m.motorBlock.count;
 
   if (vendor === 'unknown') {
     return `package ${BASE_PKG}.${p.pkg};
 
 /**
- * ${N} hardware layer -- NOT GENERATED.
+ * ${N} hardware layer — NOT GENERATED.
  *
- * The simulated mechanism uses ${count}x "${m.motorBlock.motorId}", a brushed
- * motor. Anodized only templates smart controllers (TalonFX via Phoenix 6, and
+ * The simulated mechanism uses ${m.motorBlock.count}x "${m.motorBlock.motorId}", a brushed
+ * motor. Anodized only templates smart controllers (TalonFX via Phoenix 6 and
  * SPARK MAX via REVLib), and emitting one of those here would produce code that
  * compiles and then does not run.
  *
  * Implement ${N}IO against whatever controller actually drives this mechanism.
- * The numbers the simulator does know are below, in the units the rest of the
- * generated code expects.
- *
- *   reduction              ${num(m.ratio, 4)} : 1
- *   ${p.posUnit} per rotor rotation   ${num(p.unitsPerMotorRotation, 8)}
- *   current limit          ${m.motorBlock.currentLimit} A per motor
- *   suggested kP / kI / kD ${num(g.kP)} / ${num(g.kI)} / ${num(g.kD)}  (volts per ${p.posUnit} of error)
+ * Everything the simulator derived is in ${N}Constants, in the units the rest of
+ * the generated code expects.
  */
 public class ${N}IOPhysical implements ${N}IO {
   // TODO: implement against the real motor controller.
 }
 `;
   }
-
-  const conv = `  /**
-   * ${p.posUnit} of mechanism travel per ROTOR rotation.
-   *
-   * ${m.linearDisplay
-      ? `The drum turns rotation into travel: one output turn pays out
-   * 2*pi*r = ${num(2 * Math.PI * (m.radius ?? 0), 6)} m of cable, and the rotor turns
-   * ${num(m.ratio, 4)} times per output turn.`
-      : `One output turn is 2*pi rad, and the rotor turns
-   * ${num(m.ratio, 4)} times per output turn.`}
-   */
-  private static final double UNITS_PER_ROTOR_ROTATION = ${num(p.unitsPerMotorRotation, 8)};`;
-
-  return vendor === 'talonfx'
-    ? talonFile(p, g, conv)
-    : sparkFile(p, g, conv);
+  return vendor === 'talonfx' ? talonFile(p) : sparkFile(p);
 }
 
-function talonFile(p: SubsystemPlan, g: Gains, conv: string): string {
+function talonFile(p: SubsystemPlan): string {
   const N = p.className;
   const m = p.mech;
-  const count = m.motorBlock.count;
-  const followers = Array.from({ length: count - 1 }, (_, i) => i + 1);
-  const gravityType = p.archetype === 'arm' ? 'Arm_Cosine' : 'Elevator_Static';
+  const followers = m.motorBlock.count - 1;
 
   return `package ${BASE_PKG}.${p.pkg};
+
+import static ${BASE_PKG}.${p.pkg}.${N}Constants.*;
 
 import com.ctre.phoenix6.BaseStatusSignal;
 import com.ctre.phoenix6.StatusSignal;
 import com.ctre.phoenix6.configs.TalonFXConfiguration;
 import com.ctre.phoenix6.controls.NeutralOut;
-import com.ctre.phoenix6.controls.PositionVoltage;
-import com.ctre.phoenix6.controls.VelocityVoltage;
 import com.ctre.phoenix6.controls.VoltageOut;
 import com.ctre.phoenix6.hardware.TalonFX;
-import com.ctre.phoenix6.signals.GravityTypeValue;
 import com.ctre.phoenix6.signals.InvertedValue;
 import com.ctre.phoenix6.signals.NeutralModeValue;
 import edu.wpi.first.units.measure.Angle;
@@ -498,101 +758,67 @@ import edu.wpi.first.units.measure.Temperature;
 import edu.wpi.first.units.measure.Voltage;
 
 /**
- * ${N} hardware: ${count}x ${m.motorBlock.motorId} on TalonFX (Phoenix 6).
+ * ${N} hardware: ${m.motorBlock.count}x ${m.motorBlock.motorId} on TalonFX (Phoenix 6).
  *
- * This is the only file that knows about motor controllers. Everything the
- * simulator could derive is filled in; everything it cannot -- CAN ids, which
- * way is positive, where the soft limits are -- is marked TODO, because a
- * plausible-looking guess is harder to catch than an obvious blank.
+ * Configures the motor and reports what it sees; it runs no control loop. The
+ * feedback lives in ${N}, so the only command this layer takes is a voltage.
  *
  * Generated by Anodized. Safe to edit.
  */
 public class ${N}IOPhysical implements ${N}IO {
-  // TODO: set the real CAN ids and bus name.
-  private static final int LEADER_CAN_ID = 0;${followers.length
-    ? `\n  private static final int[] FOLLOWER_CAN_IDS = new int[] {${followers.map(() => '0').join(', ')}};`
-    : ''}
-  private static final String CAN_BUS = "rio";
-
-  // TODO: confirm direction against the real mechanism -- positive should move
-  // the mechanism the same way positive does in the simulator.
-  private static final InvertedValue INVERSION = InvertedValue.CounterClockwise_Positive;
-
-  /** Per-motor stator limit, from the simulated mechanism. */
-  private static final double STATOR_LIMIT_AMPS = ${num(m.motorBlock.currentLimit, 1)};
-  private static final double SUPPLY_LIMIT_AMPS = ${num(Math.min(m.motorBlock.currentLimit, 60), 1)};
-
-${conv}
-
-  private final TalonFX leader = new TalonFX(LEADER_CAN_ID, CAN_BUS);${followers.length
+  private final TalonFX leader = new TalonFX(MOTOR_CAN_ID, CAN_BUS);${followers
     ? `\n  private final TalonFX[] followers = new TalonFX[FOLLOWER_CAN_IDS.length];`
     : ''}
 
-  private final StatusSignal<Angle> positionRotations;
-  private final StatusSignal<AngularVelocity> velocityRps;
-  private final StatusSignal<Voltage> appliedVolts;
-  private final StatusSignal<Current> statorCurrent;
-  private final StatusSignal<Current> supplyCurrent;
-  private final StatusSignal<Temperature> temperature;
+  private final StatusSignal<Angle> positionSignal;
+  private final StatusSignal<AngularVelocity> velocitySignal;
+  private final StatusSignal<Voltage> appliedVoltsSignal;
+  private final StatusSignal<Current> currentSignal;
+  private final StatusSignal<Temperature> tempSignal;
 
   /* Reused request objects. Phoenix allocates inside a control request, so
      building one per loop is avoidable garbage in the hot path. */
-  private final PositionVoltage positionRequest = new PositionVoltage(0.0).withSlot(0);
-  private final VelocityVoltage velocityRequest = new VelocityVoltage(0.0).withSlot(0);
   private final VoltageOut voltageRequest = new VoltageOut(0.0);
   private final NeutralOut neutralRequest = new NeutralOut();
 
   public ${N}IOPhysical() {
     TalonFXConfiguration config = new TalonFXConfiguration();
 
-    config.MotorOutput.Inverted = INVERSION;
+    config.MotorOutput.Inverted =
+        INVERTED ? InvertedValue.Clockwise_Positive : InvertedValue.CounterClockwise_Positive;
     config.MotorOutput.NeutralMode = NeutralModeValue.Brake;
 
-    config.CurrentLimits.StatorCurrentLimit = STATOR_LIMIT_AMPS;
+    config.CurrentLimits.StatorCurrentLimit = CURRENT_LIMIT_AMPS;
     config.CurrentLimits.StatorCurrentLimitEnable = true;
-    config.CurrentLimits.SupplyCurrentLimit = SUPPLY_LIMIT_AMPS;
+    config.CurrentLimits.SupplyCurrentLimit = CURRENT_LIMIT_AMPS;
     config.CurrentLimits.SupplyCurrentLimitEnable = true;
 
-    /* Gains translated from the simulated tune: the simulator works in duty
-       per unit of error, and these requests output volts, so each gain is
-       scaled by the nominal ${num(NOMINAL_VOLTS, 1)} V bus.
+    // Reports ${p.posUnit} directly, so the gains in ${N} need no conversion.
+    config.Feedback.SensorToMechanismRatio = 1.0 / ENCODER_CONVERSION_FACTOR;
 
-       TREAT THESE AS A STARTING POINT. They were tuned against a rigid,
-       backlash-free, noise-free model of this mechanism. Real friction,
-       real compliance, and real sensor noise are not in that model. */
-    config.Slot0.kP = ${num(g.kP)};
-    config.Slot0.kI = ${num(g.kI)};
-    config.Slot0.kD = ${num(g.kD)};
-    config.Slot0.kG = ${num(g.kG)};
-    config.Slot0.GravityType = GravityTypeValue.${gravityType};
-
-    // Gains are in ${p.posUnit}, so the controller has to report ${p.posUnit}.
-    config.Feedback.SensorToMechanismRatio = 1.0 / UNITS_PER_ROTOR_ROTATION;
-
-    // TODO: set soft limits once the mechanism's real range is known.
-    // config.SoftwareLimitSwitch.ForwardSoftLimitEnable = true;
-    // config.SoftwareLimitSwitch.ForwardSoftLimitThreshold = 0.0;
+    config.SoftwareLimitSwitch.ForwardSoftLimitEnable = SOFT_LIMITS_ENABLED;
+    config.SoftwareLimitSwitch.ForwardSoftLimitThreshold = FORWARD_SOFT_LIMIT;
+    config.SoftwareLimitSwitch.ReverseSoftLimitEnable = SOFT_LIMITS_ENABLED;
+    config.SoftwareLimitSwitch.ReverseSoftLimitThreshold = REVERSE_SOFT_LIMIT;
 
     leader.getConfigurator().apply(config);
-${followers.length ? `
+${followers ? `
     for (int i = 0; i < FOLLOWER_CAN_IDS.length; i++) {
       followers[i] = new TalonFX(FOLLOWER_CAN_IDS[i], CAN_BUS);
       followers[i].getConfigurator().apply(config);
-      // TODO: second argument is "opposeMasterDirection" -- true when the
-      // motors face opposite ways on the gearbox.
-      followers[i].setControl(new com.ctre.phoenix6.controls.Follower(LEADER_CAN_ID, false));
+      // TODO: second argument is "opposeMasterDirection" — true when the motors
+      // face opposite ways on the gearbox.
+      followers[i].setControl(new com.ctre.phoenix6.controls.Follower(MOTOR_CAN_ID, false));
     }
 ` : ''}
-    positionRotations = leader.getPosition();
-    velocityRps = leader.getVelocity();
-    appliedVolts = leader.getMotorVoltage();
-    statorCurrent = leader.getStatorCurrent();
-    supplyCurrent = leader.getSupplyCurrent();
-    temperature = leader.getDeviceTemp();
+    positionSignal = leader.getPosition();
+    velocitySignal = leader.getVelocity();
+    appliedVoltsSignal = leader.getMotorVoltage();
+    currentSignal = leader.getStatorCurrent();
+    tempSignal = leader.getDeviceTemp();
 
     BaseStatusSignal.setUpdateFrequencyForAll(
-        50.0, positionRotations, velocityRps, appliedVolts,
-        statorCurrent, supplyCurrent, temperature);
+        50.0, positionSignal, velocitySignal, appliedVoltsSignal, currentSignal, tempSignal);
     leader.optimizeBusUtilization();
   }
 
@@ -600,26 +826,13 @@ ${followers.length ? `
   public void updateInputs(${N}IOInputs inputs) {
     inputs.connected =
         BaseStatusSignal.refreshAll(
-                positionRotations, velocityRps, appliedVolts,
-                statorCurrent, supplyCurrent, temperature)
+                positionSignal, velocitySignal, appliedVoltsSignal, currentSignal, tempSignal)
             .isOK();
 
-    inputs.position${p.posSuffix} = positionRotations.getValueAsDouble();
-    inputs.velocity${p.velSuffix} = velocityRps.getValueAsDouble();
-    inputs.appliedVolts = appliedVolts.getValueAsDouble();
-    inputs.statorCurrentAmps = new double[] {statorCurrent.getValueAsDouble()};
-    inputs.supplyCurrentAmps = new double[] {supplyCurrent.getValueAsDouble()};
-    inputs.tempCelsius = new double[] {temperature.getValueAsDouble()};
-  }
-
-  @Override
-  public void setPositionSetpoint(double position${p.posSuffix}) {
-    leader.setControl(positionRequest.withPosition(position${p.posSuffix}));
-  }
-
-  @Override
-  public void setVelocitySetpoint(double velocity${p.velSuffix}) {
-    leader.setControl(velocityRequest.withVelocity(velocity${p.velSuffix}));
+    inputs.position${p.posSuffix} = positionSignal.getValueAsDouble();
+    inputs.velocity${p.velSuffix} = velocitySignal.getValueAsDouble();
+    inputs.appliedVolts = appliedVoltsSignal.getValueAsDouble();
+    inputs.currentAmps = currentSignal.getValueAsDouble();
   }
 
   @Override
@@ -638,87 +851,77 @@ ${followers.length ? `
   }
 
   @Override
-  public void setPosition(double position${p.posSuffix}) {
+  public void resetPosition(double position${p.posSuffix}) {
     leader.setPosition(position${p.posSuffix});
   }
 }
 `;
 }
 
-function sparkFile(p: SubsystemPlan, g: Gains, conv: string): string {
+function sparkFile(p: SubsystemPlan): string {
   const N = p.className;
   const m = p.mech;
-  const count = m.motorBlock.count;
-  const brushed = false;
+  const followers = m.motorBlock.count - 1;
 
   return `package ${BASE_PKG}.${p.pkg};
 
+import static ${BASE_PKG}.${p.pkg}.${N}Constants.*;
+
 import com.revrobotics.RelativeEncoder;
-import com.revrobotics.spark.SparkBase.ControlType;
 import com.revrobotics.spark.SparkBase.PersistMode;
 import com.revrobotics.spark.SparkBase.ResetMode;
-import com.revrobotics.spark.SparkClosedLoopController;
 import com.revrobotics.spark.SparkLowLevel.MotorType;
 import com.revrobotics.spark.SparkMax;
 import com.revrobotics.spark.config.SparkBaseConfig.IdleMode;
 import com.revrobotics.spark.config.SparkMaxConfig;
 
 /**
- * ${N} hardware: ${count}x ${m.motorBlock.motorId} on SPARK MAX (REVLib).
+ * ${N} hardware: ${m.motorBlock.count}x ${m.motorBlock.motorId} on SPARK MAX (REVLib).
  *
- * This is the only file that knows about motor controllers. Everything the
- * simulator could derive is filled in; everything it cannot -- CAN ids, which
- * way is positive, where the soft limits are -- is marked TODO, because a
- * plausible-looking guess is harder to catch than an obvious blank.
+ * Configures the motor and reports what it sees; it runs no control loop. The
+ * feedback lives in ${N}, so the only command this layer takes is a voltage.
  *
  * Generated by Anodized. Safe to edit.
  */
 public class ${N}IOPhysical implements ${N}IO {
-  // TODO: set the real CAN ids.
-  private static final int LEADER_CAN_ID = 0;${count > 1
-    ? `\n  private static final int[] FOLLOWER_CAN_IDS = new int[] {${Array.from({ length: count - 1 }, () => '0').join(', ')}};`
-    : ''}
-
-  // TODO: confirm direction against the real mechanism.
-  private static final boolean INVERTED = false;
-
-  private static final int CURRENT_LIMIT_AMPS = ${Math.round(m.motorBlock.currentLimit)};
-
-${conv}
-
-  private final SparkMax leader = new SparkMax(LEADER_CAN_ID, MotorType.k${brushed ? 'Brushed' : 'Brushless'});${count > 1
+  private final SparkMax spark = new SparkMax(MOTOR_CAN_ID, MotorType.kBrushless);${followers
     ? `\n  private final SparkMax[] followers = new SparkMax[FOLLOWER_CAN_IDS.length];`
     : ''}
-  private final RelativeEncoder encoder = leader.getEncoder();
-  private final SparkClosedLoopController controller = leader.getClosedLoopController();
+  private final RelativeEncoder encoder = spark.getEncoder();
 
   public ${N}IOPhysical() {
     SparkMaxConfig config = new SparkMaxConfig();
-    config.inverted(INVERTED).idleMode(IdleMode.kBrake).smartCurrentLimit(CURRENT_LIMIT_AMPS);
+    config
+        .idleMode(IdleMode.kBrake)
+        .inverted(INVERTED)
+        .smartCurrentLimit(CURRENT_LIMIT_AMPS)
+        // Makes a voltage request mean the same thing at 12.6 V and at 9 V,
+        // which is what the feedforward in ${N} assumes.
+        .voltageCompensation(12.0);
 
-    /* The encoder is scaled so every reading is already in ${p.posUnit} --
-       the subsystem, the gains, and the setpoints then all share one unit and
-       nothing has to remember to convert. */
-    config.encoder
-        .positionConversionFactor(UNITS_PER_ROTOR_ROTATION)
-        .velocityConversionFactor(UNITS_PER_ROTOR_ROTATION / 60.0);
+    /* Scaled so every reading is already in ${p.posUnit} — the state machine, the
+       gains, and the setpoints then share one unit and nothing has to remember
+       to convert. */
+    config
+        .encoder
+        .positionConversionFactor(ENCODER_CONVERSION_FACTOR)
+        .velocityConversionFactor(ENCODER_CONVERSION_FACTOR / 60.0);
 
-    /* Gains translated from the simulated tune: the simulator works in duty
-       per unit of error, and these are volts per unit, so each is scaled by
-       the nominal ${num(NOMINAL_VOLTS, 1)} V bus.
+    config
+        .softLimit
+        .forwardSoftLimit(FORWARD_SOFT_LIMIT)
+        .forwardSoftLimitEnabled(SOFT_LIMITS_ENABLED)
+        .reverseSoftLimit(REVERSE_SOFT_LIMIT)
+        .reverseSoftLimitEnabled(SOFT_LIMITS_ENABLED);
 
-       TREAT THESE AS A STARTING POINT -- they were tuned against a rigid,
-       frictionless, noise-free model. */
-    config.closedLoop.pid(${num(g.kP)}, ${num(g.kI)}, ${num(g.kD)});
-
-    leader.configure(config, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
-${count > 1 ? `
+    spark.configure(config, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
+${followers ? `
     for (int i = 0; i < FOLLOWER_CAN_IDS.length; i++) {
       followers[i] = new SparkMax(FOLLOWER_CAN_IDS[i], MotorType.kBrushless);
       SparkMaxConfig followerConfig = new SparkMaxConfig();
       followerConfig.apply(config);
       // TODO: second argument is "invert relative to leader".
-      followerConfig.follow(LEADER_CAN_ID, false);
+      followerConfig.follow(MOTOR_CAN_ID, false);
       followers[i].configure(
           followerConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
     }
@@ -728,67 +931,58 @@ ${count > 1 ? `
 
   @Override
   public void updateInputs(${N}IOInputs inputs) {
-    // REVLib surfaces faults rather than a link state; a sticky fault frame
-    // that never arrives leaves this false.
-    inputs.connected = leader.getFirmwareVersion() != 0;
+    // REVLib surfaces faults rather than a link state; a firmware frame that
+    // never arrives leaves this false.
+    inputs.connected = spark.getFirmwareVersion() != 0;
 
     inputs.position${p.posSuffix} = encoder.getPosition();
     inputs.velocity${p.velSuffix} = encoder.getVelocity();
-    inputs.appliedVolts = leader.getAppliedOutput() * leader.getBusVoltage();
-    inputs.statorCurrentAmps = new double[] {leader.getOutputCurrent()};
-    inputs.supplyCurrentAmps = new double[] {leader.getOutputCurrent()};
-    inputs.tempCelsius = new double[] {leader.getMotorTemperature()};
-  }
-
-  @Override
-  public void setPositionSetpoint(double position${p.posSuffix}) {
-    controller.setReference(position${p.posSuffix}, ControlType.kPosition);
-  }
-
-  @Override
-  public void setVelocitySetpoint(double velocity${p.velSuffix}) {
-    controller.setReference(velocity${p.velSuffix}, ControlType.kVelocity);
+    inputs.appliedVolts = spark.getAppliedOutput() * spark.getBusVoltage();
+    inputs.currentAmps = spark.getOutputCurrent();
   }
 
   @Override
   public void setVoltage(double volts) {
-    leader.setVoltage(volts);
+    spark.setVoltage(volts);
   }
 
   @Override
   public void stop() {
-    leader.stopMotor();
+    spark.stopMotor();
   }
 
   @Override
   public void setBrakeMode(boolean enabled) {
     SparkMaxConfig config = new SparkMaxConfig();
     config.idleMode(enabled ? IdleMode.kBrake : IdleMode.kCoast);
-    leader.configure(config, ResetMode.kNoResetSafeParameters, PersistMode.kNoPersistParameters);
+    spark.configure(
+        config, ResetMode.kNoResetSafeParameters, PersistMode.kNoPersistParameters);
   }
 
   @Override
-  public void setPosition(double position${p.posSuffix}) {
+  public void resetPosition(double position${p.posSuffix}) {
     encoder.setPosition(position${p.posSuffix});
   }
 }
 `;
 }
 
+/* --- sim layer ------------------------------------------------------------ */
+
 function simFile(p: SubsystemPlan): string {
   const N = p.className;
   const m = p.mech;
-  const g = gainsFor(m);
   const dc = DC_MOTOR[m.motorBlock.motorId] ?? 'getKrakenX60';
   const count = m.motorBlock.count;
   const toBase = UNITS[p.posUnit]?.toBase ?? 1;
 
-  // The WPILib sims all work in SI, so the IO layer converts at its boundary
-  // exactly the way the real controller's conversion factor does.
-  let decl: string;
-  let read: string;
-  let readVel: string;
+  let decl: string, read: string, readVel: string, imports: string, limits: string;
   if (p.archetype === 'elevator') {
+    imports = 'import edu.wpi.first.wpilibj.simulation.ElevatorSim;';
+    limits = `  // TODO: set to the mechanism's real hard stops.
+  private static final double MIN_HEIGHT_METERS = 0.0;
+  private static final double MAX_HEIGHT_METERS = 2.0;
+`;
     decl = `  private final ElevatorSim sim =
       new ElevatorSim(
           DCMotor.${dc}(${count}),
@@ -802,6 +996,11 @@ function simFile(p: SubsystemPlan): string {
     read = 'sim.getPositionMeters()';
     readVel = 'sim.getVelocityMetersPerSecond()';
   } else if (p.archetype === 'arm') {
+    imports = 'import edu.wpi.first.wpilibj.simulation.SingleJointedArmSim;';
+    limits = `  // TODO: set to the mechanism's real hard stops.
+  private static final double MIN_ANGLE_RADS = -Math.PI;
+  private static final double MAX_ANGLE_RADS = Math.PI;
+`;
     decl = `  private final SingleJointedArmSim sim =
       new SingleJointedArmSim(
           DCMotor.${dc}(${count}),
@@ -815,6 +1014,8 @@ function simFile(p: SubsystemPlan): string {
     read = 'sim.getAngleRads()';
     readVel = 'sim.getVelocityRadPerSec()';
   } else {
+    imports = 'import edu.wpi.first.math.system.plant.LinearSystemId;\nimport edu.wpi.first.wpilibj.simulation.FlywheelSim;';
+    limits = '';
     decl = `  private final FlywheelSim sim =
       new FlywheelSim(
           LinearSystemId.createFlywheelSystem(
@@ -824,29 +1025,9 @@ function simFile(p: SubsystemPlan): string {
     readVel = 'sim.getAngularVelocityRadPerSec()';
   }
 
-  const limits = p.archetype === 'elevator'
-    ? `  // TODO: the simulator has no travel limits, so these are the observed
-  // range padded out. Set them to the mechanism's real hard stops.
-  private static final double MIN_HEIGHT_METERS = 0.0;
-  private static final double MAX_HEIGHT_METERS = 2.0;
-`
-    : p.archetype === 'arm'
-      ? `  // TODO: set to the mechanism's real hard stops.
-  private static final double MIN_ANGLE_RADS = -Math.PI;
-  private static final double MAX_ANGLE_RADS = Math.PI;
-`
-      : '';
-
-  const imports = p.archetype === 'elevator'
-    ? 'import edu.wpi.first.wpilibj.simulation.ElevatorSim;'
-    : p.archetype === 'arm'
-      ? 'import edu.wpi.first.wpilibj.simulation.SingleJointedArmSim;'
-      : 'import edu.wpi.first.math.system.plant.LinearSystemId;\nimport edu.wpi.first.wpilibj.simulation.FlywheelSim;';
-
   return `package ${BASE_PKG}.${p.pkg};
 
 import edu.wpi.first.math.MathUtil;
-import edu.wpi.first.math.controller.PIDController;
 import edu.wpi.first.math.system.plant.DCMotor;
 ${imports}
 
@@ -854,9 +1035,10 @@ ${imports}
  * ${N} against a WPILib physics sim, seeded with the plant Anodized solved:
  * ${num(m.ratio, 3)}:1 reduction, ${num(m.solid.mass, 3)} kg, ${p.archetype} geometry.
  *
- * This is not the same integrator Anodized uses, so it will not match the
- * tool's traces exactly -- it is here so the generated subsystem has something
- * to run against before the mechanism physically exists.
+ * Like the hardware layer, it runs no control loop — the same PID in ${N} drives
+ * it, which is the point: the loop you tune here is the loop that runs on the
+ * robot. It is not the same integrator Anodized uses, so it will not reproduce
+ * the tool's traces exactly.
  *
  * Generated by Anodized. Safe to edit.
  */
@@ -868,18 +1050,10 @@ public class ${N}IOSim implements ${N}IO {
 
 ${limits}${decl}
 
-  private final PIDController controller =
-      new PIDController(${num(g.kP)}, ${num(g.kI)}, ${num(g.kD)});
-
   private double appliedVolts = 0.0;
-  private boolean closedLoop = false;
 
   @Override
   public void updateInputs(${N}IOInputs inputs) {
-    if (closedLoop) {
-      appliedVolts =
-          MathUtil.clamp(controller.calculate(${read} / BASE_PER_UNIT) + ${num(g.kG)}, -12.0, 12.0);
-    }
     sim.setInputVoltage(appliedVolts);
     sim.update(LOOP_PERIOD_SECS);
 
@@ -887,26 +1061,11 @@ ${limits}${decl}
     inputs.position${p.posSuffix} = ${read} / BASE_PER_UNIT;
     inputs.velocity${p.velSuffix} = ${readVel} / BASE_PER_UNIT;
     inputs.appliedVolts = appliedVolts;
-    inputs.statorCurrentAmps = new double[] {sim.getCurrentDrawAmps()};
-    inputs.supplyCurrentAmps = new double[] {sim.getCurrentDrawAmps()};
-    inputs.tempCelsius = new double[] {0.0};
-  }
-
-  @Override
-  public void setPositionSetpoint(double position${p.posSuffix}) {
-    closedLoop = true;
-    controller.setSetpoint(position${p.posSuffix});
-  }
-
-  @Override
-  public void setVelocitySetpoint(double velocity${p.velSuffix}) {
-    closedLoop = true;
-    controller.setSetpoint(velocity${p.velSuffix});
+    inputs.currentAmps = sim.getCurrentDrawAmps();
   }
 
   @Override
   public void setVoltage(double volts) {
-    closedLoop = false;
     appliedVolts = MathUtil.clamp(volts, -12.0, 12.0);
   }
 
@@ -917,13 +1076,6 @@ ${limits}${decl}
 }
 `;
 }
-
-/* --- superstructure -------------------------------------------------------
-   A state block spans several mechanisms on purpose -- "score L4" is a claim
-   about the elevator AND the wrist at once. Generating one enum per subsystem
-   and stopping there would throw that coupling away and leave the caller to
-   remember which goals go together, which is exactly the bug states exist to
-   prevent. */
 
 function superstructureFile(
   group: ResolvedStateGroup, plans: SubsystemPlan[],
@@ -954,16 +1106,19 @@ function superstructureFile(
       // Each subsystem's goal enum was built from the same state list in the
       // same order, so index k lines up across all of them.
       const goal = p.goals[k]?.name ?? p.goals[0].name;
-      return `        ${camel(p.className)}.setGoal(${p.className}.Goal.${goal});`;
+      return `        ${camel(p.className)}.setState(${p.className}.State.${goal});`;
     }).join('\n');
     return `      case ${n} ->  {\n${lines}\n      }`;
   }).join('\n');
 
   const atGoal = members
-    .map((p) => `${camel(p.className)}.atGoal()`).join('\n        && ');
+    .map((p) => `${camel(p.className)}.atState()`).join('\n        && ');
 
-  const periodic = members
-    .map((p) => `    ${camel(p.className)}.periodic();`).join('\n');
+  /* Subsystems extend SubsystemBase, so the scheduler already calls each
+     periodic(). Calling them again here would run every mechanism's loop twice
+     per tick -- doubling the PID's effective sample rate and silently changing
+     how the gains behave. */
+  const periodic = '';
 
   return `package frc.robot.superstructure;
 
@@ -995,12 +1150,16 @@ ${enumBody}
 ${assigns}
   }
 
-  /** Call once per loop from Robot.robotPeriodic(). */
+  /**
+   * Call once per loop from Robot.robotPeriodic().
+   *
+   * This only assigns states. Each subsystem's own periodic() is already run by
+   * the command scheduler, so calling them again from here would step every
+   * mechanism twice per tick and quietly double the PID sample rate.
+   */
   public void periodic() {
     applyState();
-
 ${periodic}
-
     Logger.recordOutput("${N}/State", state);
     Logger.recordOutput("${N}/AtState", atState());
   }
@@ -1040,66 +1199,123 @@ function readmeFile(plans: SubsystemPlan[], groups: ResolvedStateGroup[]): strin
     } | ${p.mode} | ${p.goals.length} |`;
   }).join('\n');
 
+  const first = plans[0];
+
   return `# Generated subsystems
 
-Exported from Anodized. These are **state-based**, not command-based: every
-subsystem owns an enum of goals, \`setGoal\` changes which one is active, and
-\`periodic()\` drives toward it every loop. Nothing here imports
-\`edu.wpi.first.wpilibj2.command\`.
+Exported from Anodized. These are **state-based**: each subsystem owns an enum
+of states, \`setState\` changes which one is active, and \`periodic()\` runs it
+every loop through a switch where each case drives the mechanism. The current
+state is a public field, so anything can read it without an accessor. There are no \`Command\` factories — nothing takes
+ownership of a mechanism for a while, so it can never be left holding a state
+nobody asked for because a command ended early.
+
+Subsystems do extend \`SubsystemBase\`, for scheduler-driven \`periodic()\`,
+logging registration, and requirements plumbing. That is a base class, not a
+control-flow style. If you want a Command at the edge (for a button binding),
+write one that calls \`setGoal\` rather than one that drives hardware:
+
+\`\`\`java
+controller.a().onTrue(Commands.runOnce(() -> elevator.setState(State.L4), elevator));
+\`\`\`
 
 ## What is here
 
-| Subsystem | Motors | Hardware layer | Control | Goals |
+| Subsystem | Motors | Hardware layer | Control | States |
 | --- | --- | --- | --- | --- |
 ${rows}
 
-Each mechanism gets four files under \`frc/robot/subsystems/<name>/\`:
+Five files per mechanism, under \`frc/robot/subsystems/<name>/\`:
 
-- \`<Name>IO.java\` — the hardware boundary: an \`@AutoLog\` inputs struct and
-  the setters. Knows nothing about motor controllers.
-- \`<Name>IOPhysical.java\` — real hardware, configured from the simulated
-  mechanism (gearing, current limits, translated gains).
-- \`<Name>IOSim.java\` — a WPILib physics sim seeded with the same plant, so the
-  logic can run before the mechanism exists.
-- \`<Name>.java\` — the goals and the control logic, hardware-independent.
+- \`<Name>Constants.java\` — gains, goal setpoints, conversion factor, current
+  limit, CAN ids. Everything you edit at the field, in one \`static import\`-able
+  place.
+- \`<Name>IO.java\` — the hardware boundary: an \`@AutoLog\` inputs struct and the
+  setters. Knows nothing about motor controllers.
+- \`<Name>IOPhysical.java\` — real hardware, configured from the constants.
+- \`<Name>IOSim.java\` — a WPILib physics sim seeded with the same plant.
+- \`<Name>.java\` — goals and control, hardware-independent.
 
 ${groups.length ? `Combined states live in \`frc/robot/superstructure/\`, one class per state
 block, because a state like "score L4" is a claim about several mechanisms at
-once and splitting it across subsystems loses that.` : ''}
+once and splitting it across subsystems loses that.
+
+` : ''}## Where the control loop lives
+
+In the subsystem, not on the motor controller. Each closed-loop subsystem builds
+a \`PIDController\` and a feedforward from its constants, and \`periodic()\` runs
+them every tick:
+
+\`\`\`java
+// periodic()
+switch (state) {
+  case STOW -> runSetpoint(STOW_POSITION);
+  case L4   -> runSetpoint(L4_POSITION);
+}
+
+// each case runs the state:
+private void runSetpoint(double setpoint) {
+  controller.setSetpoint(setpoint);
+  double volts = controller.calculate(inputs.positionMeters) + feedforward.calculate(0.0);
+  io.setVoltage(MathUtil.clamp(volts, -12.0, 12.0));
+}
+\`\`\`
+
+That costs loop rate — a SPARK or Talon can close at 1 kHz internally, this
+closes at the 50 Hz robot loop — and buys visibility: the gains, the setpoint,
+and the state that chose it are in one file and all logged, rather than split
+between code and a value burned into controller flash. Move it onboard once the
+mechanism is tuned and the gains have stopped changing.
+
+The IO layer takes exactly one command, \`setVoltage\`, and runs no loop of its
+own. The sim layer is driven by the same controller, so the loop you tune
+against the sim is the loop that runs on the robot.
 
 ## Wiring it up
 
 \`\`\`java
-// Robot.java
-private final Elevator elevator =
-    new Elevator(Robot.isReal() ? new ElevatorIOPhysical() : new ElevatorIOSim());
-
-@Override
-public void robotPeriodic() {
-  elevator.periodic();   // or superstructure.periodic(), which calls each one
-}
+// RobotContainer.java
+private final ${first?.className ?? 'Elevator'} ${first ? camel(first.className) : 'elevator'} =
+    new ${first?.className ?? 'Elevator'}(
+        Robot.isReal()
+            ? new ${first?.className ?? 'Elevator'}IOPhysical()
+            : new ${first?.className ?? 'Elevator'}IOSim());
 \`\`\`
+
+\`periodic()\` is called by the scheduler — you do not need to call it yourself.
 
 ## Before this runs
 
 Search the export for \`TODO\`. The simulator models physics, so it knows
-gearing, inertia, and current limits — it has no way to know:
+gearing, inertia, and current limits. It has no way to know:
 
 - **CAN ids** — every one is \`0\`.
-- **Inversion and sensor phase** — positive has to move the mechanism the same
-  way it does in the simulator.
-- **Soft limits** — the simulator has no hard stops.
+- **Inversion and sensor phase** — positive must move the mechanism the same way
+  positive moves it in the simulator.
+- **Soft limits** — the simulator has no hard stops, so they ship disabled.
 
 ## About the gains
 
 Gains are translated from the simulated tune (duty per unit of error, scaled by
 a nominal 12 V bus) and are **a starting point only**. They were tuned against a
-rigid, backlash-free, noise-free model. Retune on the real mechanism.
+rigid, backlash-free, noise-free model. \`KS\` and \`KV\` start at zero because
+static friction and velocity feedforward are not modelled at all. Retune on the
+real mechanism.
+
+\`MAX_VELOCITY\` and \`MAX_ACCELERATION\` are infinite, meaning no motion profile —
+the controller drives straight at the setpoint, which is what was simulated. Set
+real numbers to profile the approach, and expect to retune \`KP\` when you do.
+
+## If you have tunable numbers
+
+The constants files are the drop-in point. Replace a gain field with your
+tunable type and nothing else in the mechanism changes — no logic file reads a
+gain directly.
 
 ## Dependencies
 
-AdvantageKit (for \`@AutoLog\` and \`Logger\`), plus Phoenix 6 and/or REVLib
-depending on the hardware layers above.
+AdvantageKit (for \`@AutoLog\`, \`@AutoLogOutput\`, and \`Logger\`), WPILib, plus
+Phoenix 6 and/or REVLib depending on the hardware layers above.
 `;
 }
 
@@ -1120,6 +1336,7 @@ export function generateJava(
 
   for (const p of plans) {
     const dir = `${root}/src/main/java/frc/robot/subsystems/${p.pkg}`;
+    entries.push({ path: `${dir}/${p.className}Constants.java`, text: constantsFile(p) });
     entries.push({ path: `${dir}/${p.className}IO.java`, text: ioFile(p) });
     entries.push({ path: `${dir}/${p.className}.java`, text: subsystemFile(p) });
     entries.push({ path: `${dir}/${p.className}IOPhysical.java`, text: physicalFile(p) });

@@ -86,7 +86,7 @@ export function BatteryNode({ data, id, selected }: NodeProps) {
   const hasError = (data as Data).hasError;
   return (
     <Shell kind="battery" id={id} selected={selected} hasError={hasError} title="Battery"
-      sub={<>{b.vOc.toFixed(2)} V open circuit<br />{((b.rBatt + b.rBranch) * 1000).toFixed(0)} mΩ internal</>}>
+      sub={<>{b.vOc.toFixed(2)} V open circuit<br />{((b.rBatt + b.rBranch) * 1000).toFixed(0)} mΩ total ({(b.rBatt * 1000).toFixed(0)} cell + {(b.rBranch * 1000).toFixed(1)} wiring)</>}>
       <Port id="out" type="electrical" direction="out" position={Position.Right} offset="60%" />
       <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
     </Shell>

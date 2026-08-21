@@ -64,10 +64,17 @@ export function Inspector({
         <>
           <Num label="Open-circuit voltage" value={block.vOc} step={0.1}
             onChange={(v) => set('vOc', v)} hint="12.6 V fresh, about 12.0 V mid-match" />
-          <Num label="Internal resistance (mΩ)" value={block.rBatt * 1000} step={1}
+          <Num label="Cell (internal) resistance (mΩ)" value={block.rBatt * 1000} step={1}
             onChange={(v) => set('rBatt', v / 1000)} hint="15–20 mΩ for an MK ES17-12" />
           <Num label="Wire and breaker (mΩ)" value={block.rBranch * 1000} step={0.5}
             onChange={(v) => set('rBranch', v / 1000)} />
+          {/* Read-only: the node card on the canvas shows this same total, so
+              it needs to be visible here too rather than making someone add
+              the two fields above by hand to check they match. */}
+          <div className="hint" style={{ marginTop: -6, marginBottom: 11 }}>
+            Total circuit resistance: {((block.rBatt + block.rBranch) * 1000).toFixed(1)} mΩ
+            (what the canvas card and the simulator both use for sag).
+          </div>
         </>
       )}
 

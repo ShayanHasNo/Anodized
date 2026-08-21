@@ -17,6 +17,8 @@ import { Library } from './Library';
 import { ActionsView, compileProgram, programDuration, type Program, type Action } from './ActionsView';
 import type { ResolvedStateGroup } from './sim/compile';
 import { serialize, deserialize, highestIdSuffix, downloadJson, filenameFor } from './persist';
+import { generateJava } from './export/java';
+import { makeZip, downloadBlob } from './export/zip';
 import { dimensionOf, conversionFactor, unitLabel } from './sim/units';
 import { MotionView, type MotionMech } from './motion/MotionView';
 import { archetypeFor } from './motion/archetypes';
@@ -182,6 +184,8 @@ export default function App() {
   const [stateGroups, setStateGroups] = useState<ResolvedStateGroup[]>([]);
   const [frame, setFrame] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [exportNote, setExportNote] =
+    useState<{ text: string; warnings: string[] } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [duration, setDuration] = useState(1.5);
   const [designName, setDesignName] = useState('Untitled design');
@@ -821,6 +825,30 @@ export default function App() {
   const renamePlotter = (id: string, title: string) =>
     setNodes((ns) => ns.map((n) => (n.id === id ? { ...n, data: { ...n.data, title } } : n)));
 
+  /* Code export compiles the graph fresh rather than reusing the last run's
+     result: the export has to reflect what is on the canvas right now, and a
+     stale success from before an edit would silently ship the wrong gains. A
+     design that does not compile cannot be exported, and says why. */
+  const onExportCode = () => {
+    try {
+      const sys = compile(blocks, toSimEdges(), groups);
+      const { entries, plans, warnings } = generateJava(sys, groups, designName);
+      const base = filenameFor(designName).replace(/\.json$/, '');
+      downloadBlob(`${base}-java.zip`, makeZip(entries));
+      setExportNote({
+        text: `Exported ${plans.length} subsystem${plans.length === 1 ? '' : 's'}`
+          + ` (${entries.length} files).`,
+        warnings,
+      });
+      setError(null);
+      setErrorBlockId(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setErrorBlockId(e instanceof CompileError ? e.blockId ?? null : null);
+      setExportNote(null);
+    }
+  };
+
   const onSave = () => {
     downloadJson(filenameFor(designName), serialize(nodes, edges, duration, designName, programs, actions));
   };
@@ -917,6 +945,10 @@ export default function App() {
             e.target.value = '';
           }}
         />
+        <button className="btn" onClick={onExportCode}
+          title="Download WPILib + AdvantageKit subsystems for these mechanisms">
+          Export code
+        </button>
         <button className="btn" onClick={() => setShowLibrary(true)}>Library</button>
         {programs.length > 0 && (
           <select
@@ -952,6 +984,16 @@ export default function App() {
         <div className="loadbar">
           {loadError}
           <button className="iconbtn" onClick={() => setLoadError(null)}>×</button>
+        </div>
+      )}
+
+      {exportNote && (
+        <div className="loadbar ok">
+          <span>{exportNote.text}</span>
+          {exportNote.warnings.map((w) => (
+            <span key={w} className="export-warn">{w}</span>
+          ))}
+          <button className="iconbtn" onClick={() => setExportNote(null)}>×</button>
         </div>
       )}
 
