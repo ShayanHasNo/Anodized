@@ -18,14 +18,24 @@
  * different algorithm.
  */
 
-import { System, Mechanism, G_ACCEL } from './compile';
+import { System, ConditionNode, Mechanism, G_ACCEL } from './compile';
 import { Channel, channelsFor } from './blocks';
 
+
+/**
+ * Values for the manual triggers in the programming graph, keyed by block id.
+ *
+ * Passed in per run rather than read off the blocks so that flipping a switch
+ * in the Motion tab does not edit the design -- a trigger's block value is its
+ * STARTING position, and this is where it currently is.
+ */
+export type TriggerValues = Record<string, boolean>;
 
 export interface SimOptions {
   duration: number; // seconds
   dt?: number;       // override the auto-selected timestep
   schedule?: ScheduleEvent[];
+  triggers?: TriggerValues;
 }
 
 /**
@@ -45,6 +55,7 @@ export interface RunOptions {
   duration: number;
   dt?: number;
   schedule?: ScheduleEvent[];
+  triggers?: TriggerValues;
 }
 
 /**
@@ -60,6 +71,17 @@ export interface Run {
   advance(n: number): number;
   /** Current results. Cheap -- returns views over the live buffers. */
   snapshot(): SimResult;
+  /**
+   * Changes the manual triggers WITHOUT restarting.
+   *
+   * The whole point of a live run is that it has state -- positions,
+   * velocities, integrator windup, latch memory. Rebuilding the run to change
+   * a trigger throws all of that away and starts from rest, which is why
+   * flipping a switch made the animation jump back to the beginning. Mutating
+   * the values in place is what a real robot does when an operator presses a
+   * button: nothing resets, the next loop just reads something different.
+   */
+  setTriggers(values: TriggerValues): void;
 }
 
 export interface MechanismResult {
@@ -137,6 +159,12 @@ interface Branch {
   startMeas: number;
   peakCurrent: number;
   timeToTarget: number | null;
+}
+
+/** Keeps the first channel per key; a condition reached twice allocates once. */
+function dedupeChannels(list: Channel[]): Channel[] {
+  const seen = new Set<string>();
+  return list.filter((c) => (seen.has(c.key) ? false : (seen.add(c.key), true)));
 }
 
 export function createRun(sys: System, opts: RunOptions): Run {
@@ -221,6 +249,20 @@ export function createRun(sys: System, opts: RunOptions): Run {
       ...m.passiveChildren.flatMap((sb) => channelsFor(sb)),
       ...(m.controller ? channelsFor(m.controller) : []),
     ]),
+    /* Every condition and trigger gets a channel. Seeing WHEN a condition went
+       true, lined up against the position trace that caused it, is most of
+       debugging a state machine -- so they are plottable like any measurement.
+       Deduplicated because one condition node can be reached from several
+       rules, and allocating its buffer twice would leave the second write
+       going to a array nothing reads. */
+    ...dedupeChannels([
+      ...sys.program.conditions.map((c) => ({
+        key: `${c.blockId}.value`, label: c.label, unit: '0/1', family: 'duty' as const,
+      })),
+      ...sys.program.triggers.map((t) => ({
+        key: `${t.blockId}.value`, label: t.label, unit: '0/1', family: 'duty' as const,
+      })),
+    ]),
   ];
   const data: Record<string, Float64Array> = {};
   for (const ch of channels) data[ch.key] = new Float64Array(capacity);
@@ -248,6 +290,85 @@ export function createRun(sys: System, opts: RunOptions): Run {
   const activeTargets: Record<string, number> = {};
   let scheduleCursor = 0;
 
+  /* --- the programming layer ---------------------------------------------
+     Conditions are evaluated once per step, before the controllers run, so a
+     rule that fires this step changes what the controllers are chasing on the
+     SAME step rather than one late. Latches keep their own memory across
+     steps; everything else is a pure function of the current state. */
+  const program = sys.program;
+  const triggerValues: TriggerValues = { ...(opts.triggers ?? {}) };
+  for (const tr of program.triggers) {
+    if (!(tr.blockId in triggerValues)) triggerValues[tr.blockId] = tr.initial;
+  }
+  const latched = new Set<string>();
+  /** Last evaluated value of every condition node, for logging. */
+  const conditionValue: Record<string, number> = {};
+
+  function evalCondition(node: ConditionNode): boolean {
+    let out: boolean;
+    switch (node.kind) {
+      case 'sensor': {
+        const br = branchBySolidId.get(node.solidId);
+        if (!br) { out = false; break; }
+        /* Compared in the solid's DISPLAY units, because that is the unit the
+           threshold was typed in. posScale/velScale are the same conversions
+           the plotter and the controllers use, so a threshold set from a graph
+           reading means the same thing here. */
+        const value = node.signal === 'velocity'
+          ? br.omega * br.velScale
+          : br.theta * br.posScale;
+        out = node.direction === 'above' ? value >= node.threshold : value <= node.threshold;
+        break;
+      }
+      case 'trigger':
+        out = triggerValues[node.blockId] ?? node.initial;
+        break;
+      case 'and':
+        out = evalCondition(node.a) && evalCondition(node.b);
+        break;
+      case 'or':
+        out = evalCondition(node.a) || evalCondition(node.b);
+        break;
+      case 'not':
+        out = !evalCondition(node.a);
+        break;
+      case 'latch':
+        /* Once true, stays true: "it reached the top at some point" rather
+           than "it is at the top now". Sequencing needs the first one -- a
+           mechanism that passes its trigger point and keeps going would
+           otherwise un-fire the step that was waiting on it. */
+        if (!latched.has(node.blockId) && evalCondition(node.a)) latched.add(node.blockId);
+        out = latched.has(node.blockId);
+        break;
+    }
+    conditionValue[node.blockId] = out ? 1 : 0;
+    return out;
+  }
+
+  /** Targets currently imposed by the programming graph, replaced each step. */
+  let ruleTargets: Record<string, number> = {};
+
+  function applyRules() {
+    const next: Record<string, number> = {};
+    for (const rule of program.rules) {
+      if (!evalCondition(rule.condition)) continue;
+      const group = sys.stateGroups.find((g) => g.blockId === rule.groupId);
+      const state = group?.states.find((st) => st.name === rule.stateName);
+      if (!state) continue;
+      if (rule.hold) {
+        // A hold applies only while true, so it lives in this step's set.
+        Object.assign(next, state.targets);
+      } else {
+        /* A transition fires once and stays: written into activeTargets, the
+           same place the schedule writes, so the two cannot disagree about
+           who owns a controller -- last writer in the step wins, and a rule
+           evaluated after the schedule beats it deliberately. */
+        Object.assign(activeTargets, state.targets);
+      }
+    }
+    ruleTargets = next;
+  }
+
   let minBusVoltage = vOc;
   let peakTotalCurrent = 0;
 
@@ -272,6 +393,24 @@ export function createRun(sys: System, opts: RunOptions): Run {
       scheduleCursor++;
     }
 
+    applyRules();
+
+    /* Evaluate and log every condition, including ones not driving a state.
+       Watching when a condition WOULD have fired is how a threshold gets
+       chosen before it is committed to, so a sensor wired up only to a plotter
+       still has to be computed. Re-evaluating a node already visited by a rule
+       is harmless: conditions are pure functions of current state, and a latch
+       is monotone, so a second call cannot change an answer. */
+    for (const node of program.conditions) {
+      const key = `${node.blockId}.value`;
+      if (!data[key]) continue;
+      data[key][i] = evalCondition(node) ? 1 : 0;
+    }
+    for (const tr of program.triggers) {
+      const key = `${tr.blockId}.value`;
+      if (data[key]) data[key][i] = triggerValues[tr.blockId] ? 1 : 0;
+    }
+
     // ---- pass 1: each branch's controller, independent of the others -------
     const branchOut = branches.map((br) => {
       const { mech } = br;
@@ -285,7 +424,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
       if (ctrl && ctrl.kind === 'pid') {
         const pid = ctrl;
         const meas = br.measure(br.theta, br.omega);
-        const pidTarget = activeTargets[pid.id] ?? pid.target;
+        const pidTarget = ruleTargets[pid.id] ?? activeTargets[pid.id] ?? pid.target;
         pidErr = pidTarget - meas;
 
         // Derivative on MEASUREMENT, not on error -- differentiating error
@@ -310,7 +449,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
       } else if (ctrl && ctrl.kind === 'bangbang') {
         const bb = ctrl;
         const meas = br.measure(br.theta, br.omega);
-        bbErr = (activeTargets[bb.id] ?? bb.target) - meas;
+        bbErr = (ruleTargets[bb.id] ?? activeTargets[bb.id] ?? bb.target) - meas;
         bbOut = bbErr > bb.deadband ? bb.output : bbErr < -bb.deadband ? -bb.output : 0;
         duty = bbOut;
       } else if (ctrl && ctrl.kind === 'lqr' && mech.lqrGains) {
@@ -321,7 +460,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
         // velocity CHANNEL is set to display -- targetVel is in posUnit/s.
         const posMeas = br.theta * br.posScale;
         const velMeas = br.omega * br.posScale;
-        lqrPosErr = (activeTargets[lqr.id] ?? lqr.targetPos) - posMeas;
+        lqrPosErr = (ruleTargets[lqr.id] ?? activeTargets[lqr.id] ?? lqr.targetPos) - posMeas;
         lqrVelErr = lqr.targetVel - velMeas;
 
         if (lqr.gravityFeedforward) {
@@ -337,7 +476,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
         // are turned into the duty that would produce them across the bus as
         // it stood a step ago. Asking for more than the bus can give saturates
         // at full duty below, which is what a real controller does too.
-        voltCmd = activeTargets[ctrl.id] ?? ctrl.volts;
+        voltCmd = ruleTargets[ctrl.id] ?? activeTargets[ctrl.id] ?? ctrl.volts;
         duty = voltCmd / Math.max(1e-6, busPrev);
       } else {
         duty = mech.motorBlock.duty;
@@ -449,7 +588,7 @@ export function createRun(sys: System, opts: RunOptions): Run {
       const ctrl = mech.controller;
       const pidLike = ctrl && (ctrl.kind === 'pid' || ctrl.kind === 'bangbang');
       if (pidLike) {
-        const target = activeTargets[ctrl!.id]
+        const target = ruleTargets[ctrl!.id] ?? activeTargets[ctrl!.id]
           ?? (ctrl!.kind === 'pid' ? ctrl!.target : (ctrl as { target: number }).target);
         const err = ctrl!.kind === 'pid' ? o.pidErr : o.bbErr;
         const m = target - err;
@@ -566,6 +705,11 @@ export function createRun(sys: System, opts: RunOptions): Run {
       return n;
     },
     snapshot,
+    setTriggers(values: TriggerValues) {
+      /* Assigned into the existing object rather than replaced, so the closure
+         the condition evaluator captured keeps pointing at live data. */
+      Object.assign(triggerValues, values);
+    },
   };
 }
 

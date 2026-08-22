@@ -415,6 +415,124 @@ export function Inspector({
         </>
       )}
 
+      {(block.kind === 'limitSwitch' || block.kind === 'encoder'
+        || block.kind === 'if' || block.kind === 'waitUntil'
+        || block.kind === 'while' || block.kind === 'trigger') && (
+        <div className="field">
+          <label>Label</label>
+          <input type="text" value={block.label}
+            onChange={(e) => onChange({ ...block, label: e.target.value } as Block)} />
+          <div className="hint">
+            Shown on the block and used to name the condition in exported code.
+          </div>
+        </div>
+      )}
+
+      {block.kind === 'limitSwitch' && (
+        <>
+          <Num label="Trips at position" value={block.position} step={0.05}
+            onChange={(v) => set('position', v)}
+            hint="In the watched solid's display units." />
+          <div className="field">
+            <label>Reads true when</label>
+            <select value={block.direction}
+              onChange={(e) => set('direction', e.target.value as never)}>
+              <option value="below">Position is at or below it</option>
+              <option value="above">Position is at or above it</option>
+            </select>
+            <div className="hint">
+              A bottom limit switch reads true below its threshold; a top one
+              reads true above.
+            </div>
+          </div>
+          <div className="hint" style={{ marginBottom: 11 }}>
+            Wire a solid&rsquo;s pentagon port into the top of this block. Only
+            arms and elevators can carry one &mdash; a spinning solid has no
+            travel limit for a switch to sit at, so the compiler rejects it
+            rather than accepting a switch that could never fire.
+          </div>
+        </>
+      )}
+
+      {block.kind === 'encoder' && (
+        <>
+          <div className="field">
+            <label>Watches</label>
+            <select value={block.mode} onChange={(e) => set('mode', e.target.value as never)}>
+              <option value="position">Position</option>
+              <option value="velocity">Velocity</option>
+            </select>
+          </div>
+          <Num label="Threshold" value={block.threshold} step={0.05}
+            onChange={(v) => set('threshold', v)}
+            hint="In the watched solid's display units for that mode." />
+          <div className="field">
+            <label>Reads true when</label>
+            <select value={block.direction}
+              onChange={(e) => set('direction', e.target.value as never)}>
+              <option value="above">At or above the threshold</option>
+              <option value="below">At or below the threshold</option>
+            </select>
+          </div>
+          <div className="hint" style={{ marginBottom: 11 }}>
+            This is a condition, not a second encoder on the robot. It reads
+            the state the mechanism already reports, so exported code compares
+            against existing inputs rather than configuring new hardware.
+          </div>
+        </>
+      )}
+
+      {block.kind === 'if' && (
+        <div className="field">
+          <label>Operation</label>
+          <select value={block.op} onChange={(e) => set('op', e.target.value as never)}>
+            <option value="and">AND — both inputs true</option>
+            <option value="or">OR — either input true</option>
+            <option value="not">NOT — inverts one input</option>
+          </select>
+          <div className="hint">
+            Switching to NOT drops the B port, so any wire into B is removed.
+          </div>
+        </div>
+      )}
+
+      {block.kind === 'waitUntil' && (
+        <div className="hint" style={{ marginBottom: 11 }}>
+          Latches. Once its input has been true, it stays true for the rest of
+          the run even if the input goes false again &mdash; &ldquo;the elevator
+          reached the top at some point&rdquo; rather than &ldquo;the elevator
+          is at the top now&rdquo;. Sequencing needs the first one, or a
+          mechanism that passes its trigger point and keeps going would un-fire
+          the step waiting on it.
+        </div>
+      )}
+
+      {block.kind === 'while' && (
+        <div className="hint" style={{ marginBottom: 11 }}>
+          Holds its state only while the condition is true. A plain condition
+          wired straight to a state fires once and the state sticks; a while
+          block releases when the condition goes false, letting the resting
+          state take over again.
+        </div>
+      )}
+
+      {block.kind === 'trigger' && (
+        <div className="field">
+          <label>Starts</label>
+          <select value={block.initial ? 'on' : 'off'}
+            onChange={(e) => set('initial', (e.target.value === 'on') as never)}>
+            <option value="off">Off</option>
+            <option value="on">On</option>
+          </select>
+          <div className="hint">
+            Flip it during a run from the Motion tab. This sets where it starts;
+            flipping the switch does not edit the design. In exported code it
+            becomes a settable boolean shaped like a real sensor, so swapping in
+            hardware later is a one-line change.
+          </div>
+        </div>
+      )}
+
       {block.kind === 'joint' && (
         <>
           <div className="field">

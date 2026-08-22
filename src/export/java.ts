@@ -43,8 +43,17 @@
  * simulated plant is never the real one.
  */
 
-import { System, Mechanism, MechanismGroup, ResolvedStateGroup } from '../sim/compile';
+import {
+  System, Mechanism, MechanismGroup, ResolvedStateGroup,
+  ConditionNode, ProgramGraph,
+} from '../sim/compile';
+import {
+  conditionExpr, conditionFields, triggerSetters, latchUpdates,
+  needsDigitalInput, type ConditionContext,
+} from './conditions';
+import { generateCmd3 } from './java2027';
 import { UNITS } from '../sim/units';
+import { MOTORS } from '../sim/motors';
 import type { ZipEntry } from './zip';
 
 /* --- naming ---------------------------------------------------------------
@@ -225,12 +234,34 @@ const NOMINAL_VOLTS = 12.0;
 
 interface Gains { kP: number; kI: number; kD: number; kG: number; kS: number; kV: number; }
 
+/**
+ * Volts needed just to break the mechanism loose, derived from the Coulomb
+ * friction the simulator actually models.
+ *
+ * The solver applies `friction` as a torque at the OUTPUT shaft with a stiction
+ * band (solver.ts), so the motor has to produce friction/(G*eta) of torque to
+ * move at all. At zero speed there is no back-EMF, so the volts to make that
+ * torque follow straight from the stall figures: a motor makes `stallTorque` at
+ * `vNom`, hence volts = (tau / stallTorque) * vNom, split across the motors on
+ * the shaft.
+ *
+ * This is what KS means in WPILib's feedforward classes, so the simulated
+ * friction lands in exactly the right place rather than being thrown away.
+ */
+function staticVolts(mech: Mechanism): number {
+  const spec = MOTORS[mech.motorBlock.motorId];
+  if (!spec || mech.friction <= 0) return 0;
+  const tauPerMotor =
+    mech.friction / Math.max(1e-9, mech.ratio * mech.efficiency * mech.motorBlock.count);
+  return (tauPerMotor / spec.stallTorque) * spec.vNom;
+}
+
 function gainsFor(mech: Mechanism): Gains {
   const c = mech.controller;
   if (c && c.kind === 'pid') {
     return {
       kP: c.kP * NOMINAL_VOLTS, kI: c.kI * NOMINAL_VOLTS, kD: c.kD * NOMINAL_VOLTS,
-      kG: c.kF * NOMINAL_VOLTS, kS: 0, kV: 0,
+      kG: c.kF * NOMINAL_VOLTS, kS: staticVolts(mech), kV: 0,
     };
   }
   if (c && c.kind === 'lqr' && mech.lqrGains) {
@@ -243,7 +274,7 @@ function gainsFor(mech: Mechanism): Gains {
   return { kP: 0, kI: 0, kD: 0, kG: 0, kS: 0, kV: 0 };
 }
 
-export { gainsFor, num, pascal, vendorFor, DC_MOTOR };
+export { gainsFor, num, pascal, camel, constantName, vendorFor, DC_MOTOR, goalConstant, constantsFile, ioFile, physicalFile, simFile, toleranceFor, BASE_PKG };
 export type { Vendor };
 
 /* -------------------------------------------------------------------------
@@ -251,6 +282,19 @@ export type { Vendor };
    ------------------------------------------------------------------------- */
 
 const BASE_PKG = 'frc.robot.subsystems';
+
+/** A short human phrase for a condition, used in generated comments. */
+function describe(node: ConditionNode): string {
+  switch (node.kind) {
+    case 'sensor':
+      return `${node.label} (${node.signal} ${node.direction === 'above' ? '\u2265' : '\u2264'} ${num(node.threshold, 3)} ${node.unit})`;
+    case 'trigger': return node.label;
+    case 'and': return `${describe(node.a)} and ${describe(node.b)}`;
+    case 'or': return `${describe(node.a)} or ${describe(node.b)}`;
+    case 'not': return `not ${describe(node.a)}`;
+    case 'latch': return `${node.label} has fired`;
+  }
+}
 
 /** SCREAMING_SNAKE constant name for a goal's setpoint in the Constants file. */
 const goalConstant = (p: SubsystemPlan, goalName: string) =>
@@ -296,14 +340,14 @@ public final class ${N}Constants {
 
   /* ---- hardware ---- */
 
-  // TODO: set the real CAN id${m.motorBlock.count > 1 ? 's' : ''}.
+  // TODO: replace this — set the real CAN id${m.motorBlock.count > 1 ? 's' : ''}.
   public static final int MOTOR_CAN_ID = 0;${m.motorBlock.count > 1
     ? `\n  public static final int[] FOLLOWER_CAN_IDS = new int[] {${
       Array.from({ length: m.motorBlock.count - 1 }, () => '0').join(', ')}};`
     : ''}${vendor === 'talonfx' ? '\n  public static final String CAN_BUS = "rio";' : ''}
 
-  // TODO: confirm against the real mechanism — positive should move it the same
-  // way positive moves it in the simulator.
+  // TODO: replace this — confirm against the real mechanism. Positive should
+  // move it the same way positive moves it in the simulator.
   public static final boolean INVERTED = false;
 
   /** Per-motor current limit, from the simulated mechanism. */
@@ -333,19 +377,29 @@ ${p.archetype === 'arm' ? `
      Translated from the simulated tune: the simulator works in duty per unit of
      error and these output volts, so each is scaled by a nominal ${num(NOMINAL_VOLTS, 1)} V bus.
 
-     TREAT THESE AS A STARTING POINT. They were tuned against a rigid,
-     backlash-free, noise-free model of this mechanism. Real friction, real
-     compliance, and real sensor noise are not in that model. */
+     TREAT THESE AS A STARTING POINT. The model has Coulomb friction and
+     gravity, but no backlash, no compliance, no belt stretch, and no sensor
+     noise. Those all cost phase margin on a real mechanism. */
 
   public static final double KP = ${num(g.kP)};
   public static final double KI = ${num(g.kI)};
   public static final double KD = ${num(g.kD)};
   /** Gravity feedforward, from the simulated kF. */
   public static final double KG = ${num(g.kG)};
-  /** Static friction — not modelled by the simulator, so it starts at zero. */
-  public static final double KS = 0.0;
-  /** Velocity feedforward — not modelled by the simulator, so it starts at zero. */
-  public static final double KV = 0.0;
+  /**
+   * Volts needed just to break the mechanism loose, derived from the ${num(m.friction, 3)} N·m of
+   * Coulomb friction on this mechanism's solid block. The solver really does
+   * integrate that friction (with a stiction band), so this is a computed
+   * number rather than a placeholder — but it is only as good as the friction
+   * figure that was entered.
+   */
+  public static final double KS = ${num(g.kS, 4)};
+  /**
+   * Velocity feedforward. Zero because the simulator models Coulomb friction
+   * but not viscous (speed-proportional) drag, which is what KV represents —
+   * there is nothing honest to derive it from. Characterise on the robot.
+   */
+  public static final double KV = ${num(g.kV)};
 
   /* ---- motion limits ----
      Infinity means no motion profile: the controller drives straight at the
@@ -355,15 +409,15 @@ ${p.archetype === 'arm' ? `
   public static final double MAX_VELOCITY = Double.POSITIVE_INFINITY;
   public static final double MAX_ACCELERATION = Double.POSITIVE_INFINITY;
 
-  // TODO: set to the mechanism's real range of travel. The simulator has no
-  // hard stops, so it cannot infer these.
+  // TODO: replace this — set the mechanism's real range of travel. The
+  // simulator has no hard stops, so it cannot infer these.
   public static final double FORWARD_SOFT_LIMIT = 0.0;
   public static final double REVERSE_SOFT_LIMIT = 0.0;
   public static final boolean SOFT_LIMITS_ENABLED = false;
 
   /* ---- setpoints ---- */
 
-  /** How close counts as "there", in ${unit}. TODO: tune on the robot. */
+  /** How close counts as "there", in ${unit}. TODO: replace this — tune on the robot. */
   public static final double TOLERANCE = ${num(toleranceFor(p))};
 
 ${goalConsts}
@@ -727,7 +781,7 @@ function physicalFile(p: SubsystemPlan): string {
  * the generated code expects.
  */
 public class ${N}IOPhysical implements ${N}IO {
-  // TODO: implement against the real motor controller.
+  // TODO: replace this — implement against the real motor controller.
 }
 `;
   }
@@ -806,8 +860,8 @@ ${followers ? `
     for (int i = 0; i < FOLLOWER_CAN_IDS.length; i++) {
       followers[i] = new TalonFX(FOLLOWER_CAN_IDS[i], CAN_BUS);
       followers[i].getConfigurator().apply(config);
-      // TODO: second argument is "opposeMasterDirection" — true when the motors
-      // face opposite ways on the gearbox.
+      // TODO: replace this — second argument is "opposeMasterDirection", true
+      // when the motors face opposite ways on the gearbox.
       followers[i].setControl(new com.ctre.phoenix6.controls.Follower(MOTOR_CAN_ID, false));
     }
 ` : ''}
@@ -920,7 +974,7 @@ ${followers ? `
       followers[i] = new SparkMax(FOLLOWER_CAN_IDS[i], MotorType.kBrushless);
       SparkMaxConfig followerConfig = new SparkMaxConfig();
       followerConfig.apply(config);
-      // TODO: second argument is "invert relative to leader".
+      // TODO: replace this — second argument is "invert relative to leader".
       followerConfig.follow(MOTOR_CAN_ID, false);
       followers[i].configure(
           followerConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
@@ -979,7 +1033,7 @@ function simFile(p: SubsystemPlan): string {
   let decl: string, read: string, readVel: string, imports: string, limits: string;
   if (p.archetype === 'elevator') {
     imports = 'import edu.wpi.first.wpilibj.simulation.ElevatorSim;';
-    limits = `  // TODO: set to the mechanism's real hard stops.
+    limits = `  // TODO: replace this — set the mechanism's real hard stops.
   private static final double MIN_HEIGHT_METERS = 0.0;
   private static final double MAX_HEIGHT_METERS = 2.0;
 `;
@@ -997,7 +1051,7 @@ function simFile(p: SubsystemPlan): string {
     readVel = 'sim.getVelocityMetersPerSecond()';
   } else if (p.archetype === 'arm') {
     imports = 'import edu.wpi.first.wpilibj.simulation.SingleJointedArmSim;';
-    limits = `  // TODO: set to the mechanism's real hard stops.
+    limits = `  // TODO: replace this — set the mechanism's real hard stops.
   private static final double MIN_ANGLE_RADS = -Math.PI;
   private static final double MAX_ANGLE_RADS = Math.PI;
 `;
@@ -1078,7 +1132,7 @@ ${limits}${decl}
 }
 
 function superstructureFile(
-  group: ResolvedStateGroup, plans: SubsystemPlan[],
+  group: ResolvedStateGroup, plans: SubsystemPlan[], program: ProgramGraph,
 ): string {
   const N = pascal(group.label, 'Superstructure');
   const members = plans.filter((p) => p.mech.controller
@@ -1114,6 +1168,29 @@ function superstructureFile(
   const atGoal = members
     .map((p) => `${camel(p.className)}.atState()`).join('\n        && ');
 
+  /* --- the programming layer -------------------------------------------
+     Rules that target THIS group become checks in the loop. The classic
+     framework has no transition graph to hand them to, so they are plain ifs
+     evaluated every tick, in declaration order, last match winning -- which is
+     the same precedence the simulator applies. */
+  const ctx: ConditionContext = { plans };
+  const myRules = program.rules.filter((r) => r.groupId === group.blockId);
+  const roots = myRules.map((r) => r.condition);
+
+  const ruleChecks = myRules.map((r, k) => {
+    const stateConst = stateNames[group.states.findIndex((st) => st.name === r.stateName)]
+      ?? stateNames[0];
+    return `    // ${r.hold ? 'While' : 'When'} ${describe(r.condition)}\n`
+      + `    if (${conditionExpr(r.condition, ctx)}) {\n`
+      + `      state = State.${stateConst};\n`
+      + `    }${k === myRules.length - 1 ? '' : ''}`;
+  }).join('\n');
+
+  const fieldBlock = conditionFields(roots, ctx);
+  const setters = triggerSetters(roots);
+  const latches = latchUpdates(roots, ctx);
+  const usesDio = needsDigitalInput(roots);
+
   /* Subsystems extend SubsystemBase, so the scheduler already calls each
      periodic(). Calling them again here would run every mechanism's loop twice
      per tick -- doubling the PID's effective sample rate and silently changing
@@ -1122,7 +1199,7 @@ function superstructureFile(
 
   return `package frc.robot.superstructure;
 
-import org.littletonrobotics.junction.Logger;
+${usesDio ? 'import edu.wpi.first.wpilibj.DigitalInput;\n' : ''}import org.littletonrobotics.junction.Logger;
 ${members.map((p) => `import ${BASE_PKG}.${p.pkg}.${p.className};`).join('\n')}
 
 /**
@@ -1146,6 +1223,7 @@ ${fields}
 ${enumBody}
   }
 
+${fieldBlock ? `\n${fieldBlock}\n` : ''}
   public ${N}(${params}) {
 ${assigns}
   }
@@ -1158,12 +1236,27 @@ ${assigns}
    * mechanism twice per tick and quietly double the PID sample rate.
    */
   public void periodic() {
-    applyState();
+${latches ? `    updateLatches();\n` : ''}${ruleChecks ? `    evaluateRules();\n` : ''}    applyState();
 ${periodic}
     Logger.recordOutput("${N}/State", state);
     Logger.recordOutput("${N}/AtState", atState());
   }
-
+${ruleChecks ? `
+  /**
+   * The programming graph, checked every loop.
+   *
+   * Evaluated in the order the rules were wired, last match winning — the same
+   * precedence the simulator applies, so what you saw there is what runs here.
+   */
+  private void evaluateRules() {
+${ruleChecks}
+  }
+` : ''}${latches ? `
+  /** Refreshes sticky conditions. Must run before the rules that read them. */
+  private void updateLatches() {
+${latches}
+  }
+` : ''}${setters ? `\n${setters}\n` : ''}
   public void setState(State state) {
     this.state = state;
   }
@@ -1325,9 +1418,23 @@ export interface GeneratedExport {
   warnings: string[];
 }
 
+/**
+ * Which flavour of robot code to emit.
+ *
+ * 'classic' targets today's WPILib: SubsystemBase, a switch in periodic().
+ * 'cmd3' targets the 2027 commands-v3 framework: Mechanism, coroutine-backed
+ * commands, and the declarative StateMachine API. They are separate generators
+ * rather than one with flags because the two frameworks disagree about what a
+ * subsystem IS -- one is scheduled and polls, the other hands out commands that
+ * own it -- and a single template trying to be both would serve neither.
+ */
+export type CodegenTarget = 'classic' | 'cmd3';
+
 export function generateJava(
   sys: System, groups: MechanismGroup[], designName: string,
+  target: CodegenTarget = 'classic',
 ): GeneratedExport {
+  if (target === 'cmd3') return generateCmd3(sys, groups, designName);
   const plans = planSubsystems(sys, groups);
   const entries: ZipEntry[] = [];
   const warnings: string[] = [];
@@ -1358,7 +1465,7 @@ export function generateJava(
     const name = pascal(group.label, 'Superstructure');
     entries.push({
       path: `${root}/src/main/java/frc/robot/superstructure/${name}.java`,
-      text: superstructureFile(group, plans),
+      text: superstructureFile(group, plans, sys.program),
     });
   }
 

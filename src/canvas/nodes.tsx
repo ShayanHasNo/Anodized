@@ -9,6 +9,8 @@ export const TYPE_COLOR: Record<PortType, string> = {
   signal: 'var(--signal)',
   control: 'var(--control)',
   mount: 'var(--ink-3)',
+  sense: 'var(--sense)',
+  boolean: 'var(--boolean)',
 };
 
 const SHAPE_CLASS: Record<PortType, string> = {
@@ -18,6 +20,8 @@ const SHAPE_CLASS: Record<PortType, string> = {
   signal: 'hexagon',
   control: 'bar',
   mount: 'mount',
+  sense: 'pentagon',
+  boolean: 'diamond',
 };
 
 export const KIND_ACCENT: Record<string, string> = {
@@ -32,6 +36,12 @@ export const KIND_ACCENT: Record<string, string> = {
   voltage: 'var(--control)',
   joint: 'var(--ink-3)',
   state: 'var(--ok)',
+  limitSwitch: 'var(--sense)',
+  encoder: 'var(--sense)',
+  if: 'var(--boolean)',
+  waitUntil: 'var(--boolean)',
+  while: 'var(--boolean)',
+  trigger: 'var(--boolean)',
 };
 
 function Port({
@@ -151,6 +161,8 @@ export function SolidNode({ data, id, selected }: NodeProps) {
       <Port id="mount" type="mount" direction="in" position={Position.Top} offset="50%" />
       <span className="handle-tag" style={{ top: '58%', left: 178 }}>tip</span>
       <Port id="tip" type="mount" direction="out" position={Position.Right} offset="60%" />
+      <span className="handle-tag" style={{ top: '92%', left: 178 }}>sense</span>
+      <Port id="sense" type="sense" direction="out" position={Position.Right} offset="88%" />
       <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
     </Shell>
   );
@@ -301,7 +313,115 @@ export function StateNode({ data, id, selected }: NodeProps) {
       title={b.label || 'States'}
       sub={<>{b.states.length === 0 ? 'no states yet' : `${b.states.length} state${b.states.length === 1 ? '' : 's'}`}<br />
         wire a mechanism box in</>}>
-      <Port id="mechanism" type="signal" direction="in" position={Position.Left} offset="55%" />
+      <Port id="mechanism" type="signal" direction="in" position={Position.Left} offset="30%" />
+      {/* One diamond per state, spread down the left edge. A wire landing on a
+          named port is the whole point of the programming layer: you can see
+          what drives what without opening an inspector. */}
+      {b.states.map((st, i) => (
+        <span key={`tag-${st.name}`} className="handle-tag state-tag"
+          style={{ top: `${52 + i * 15}%`, left: -6, transform: 'translateX(-100%)' }}>
+          {st.name}
+        </span>
+      ))}
+      {b.states.map((st, i) => (
+        <Port key={st.name} id={`when:${st.name}`} type="boolean" direction="in"
+          position={Position.Left} offset={`${56 + i * 15}%`} />
+      ))}
+    </Shell>
+  );
+}
+
+/* --- programming blocks --------------------------------------------------- */
+
+const DIR_LABEL = { above: '≥', below: '≤' } as const;
+
+export function LimitSwitchNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'limitSwitch' }>;
+  const hasError = (data as Data).hasError;
+  return (
+    <Shell kind="limit switch" accentKind="limitSwitch" id={id} selected={selected} hasError={hasError}
+      title={b.label || 'Limit switch'}
+      sub={<>true when pos {DIR_LABEL[b.direction]} {b.position}<br />arms and elevators only</>}>
+      <span className="handle-tag" style={{ top: -17, left: 76 }}>solid</span>
+      <Port id="solid" type="sense" direction="in" position={Position.Top} offset="50%" />
+      <Port id="value" type="boolean" direction="out" position={Position.Right} offset="60%" />
+      <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
+    </Shell>
+  );
+}
+
+export function EncoderNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'encoder' }>;
+  const hasError = (data as Data).hasError;
+  return (
+    <Shell kind="encoder" id={id} selected={selected} hasError={hasError}
+      title={b.label || 'Encoder'}
+      sub={<>true when {b.mode} {DIR_LABEL[b.direction]} {b.threshold}<br />reads the solid it watches</>}>
+      <span className="handle-tag" style={{ top: -17, left: 76 }}>solid</span>
+      <Port id="solid" type="sense" direction="in" position={Position.Top} offset="50%" />
+      <Port id="value" type="boolean" direction="out" position={Position.Right} offset="60%" />
+      <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
+    </Shell>
+  );
+}
+
+export function IfNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'if' }>;
+  const hasError = (data as Data).hasError;
+  const unary = b.op === 'not';
+  return (
+    <Shell kind="if" id={id} selected={selected} hasError={hasError}
+      title={b.label || b.op.toUpperCase()}
+      sub={<>{unary ? 'inverts its input' : `true when both sides ${b.op === 'and' ? 'are' : 'or either is'} true`}</>}>
+      <span className="handle-tag" style={{ top: '48%', left: -14 }}>A</span>
+      <Port id="a" type="boolean" direction="in" position={Position.Left} offset="55%" />
+      {!unary && <>
+        <span className="handle-tag" style={{ top: '68%', left: -14 }}>B</span>
+        <Port id="b" type="boolean" direction="in" position={Position.Left} offset="75%" />
+      </>}
+      <Port id="value" type="boolean" direction="out" position={Position.Right} offset="60%" />
+      <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
+    </Shell>
+  );
+}
+
+export function WaitUntilNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'waitUntil' }>;
+  const hasError = (data as Data).hasError;
+  return (
+    <Shell kind="wait until" accentKind="waitUntil" id={id} selected={selected} hasError={hasError}
+      title={b.label || 'Wait until'}
+      sub={<>latches true and stays true<br />once its input first fires</>}>
+      <Port id="a" type="boolean" direction="in" position={Position.Left} offset="60%" />
+      <Port id="value" type="boolean" direction="out" position={Position.Right} offset="60%" />
+      <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
+    </Shell>
+  );
+}
+
+export function WhileNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'while' }>;
+  const hasError = (data as Data).hasError;
+  return (
+    <Shell kind="while" id={id} selected={selected} hasError={hasError}
+      title={b.label || 'While'}
+      sub={<>holds its state only while<br />the condition stays true</>}>
+      <Port id="a" type="boolean" direction="in" position={Position.Left} offset="60%" />
+      <Port id="value" type="boolean" direction="out" position={Position.Right} offset="60%" />
+      <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
+    </Shell>
+  );
+}
+
+export function TriggerNode({ data, id, selected }: NodeProps) {
+  const b = (data as Data).block as Extract<Block, { kind: 'trigger' }>;
+  const hasError = (data as Data).hasError;
+  return (
+    <Shell kind="trigger" id={id} selected={selected} hasError={hasError}
+      title={b.label || 'Trigger'}
+      sub={<>flip it by hand in Motion<br />starts {b.initial ? 'on' : 'off'}</>}>
+      <Port id="value" type="boolean" direction="out" position={Position.Right} offset="60%" />
+      <Port id="signal" type="signal" direction="out" position={Position.Bottom} offset="50%" />
     </Shell>
   );
 }
@@ -319,4 +439,10 @@ export const nodeTypes = {
   state: StateNode,
   voltage: VoltageNode,
   group: GroupNode,
+  limitSwitch: LimitSwitchNode,
+  encoder: EncoderNode,
+  if: IfNode,
+  waitUntil: WaitUntilNode,
+  while: WhileNode,
+  trigger: TriggerNode,
 };

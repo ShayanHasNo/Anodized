@@ -30,6 +30,12 @@
   --electrical: #e0604a;
   --signal: #a88be0;
   --control: #e06ba8;
+  /* Programming layer. Green reads as "reads the world" and sits apart from
+     the warm/cool physical palette; teal reads as "decision" and is close
+     enough to green to group the two as one layer, far enough to tell a
+     sensor's attachment port from the boolean it produces. */
+  --sense: #5fbf8f;
+  --boolean: #43b7c4;
 
   --danger: #e0604a;
   --ok: #6fbf73;
@@ -236,6 +242,18 @@ body {
   clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%);
   width: 15px; height: 13px;
 }
+/* Pentagon: attaches to a solid. Diamond: carries a boolean. Shape answers
+   "what does this connect to" regardless of which block owns the port. */
+.react-flow__handle.xy-handle.pentagon {
+  border: none; background: var(--h);
+  clip-path: polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%);
+  width: 15px; height: 14px;
+}
+.react-flow__handle.xy-handle.diamond {
+  border: none; background: var(--h);
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+  width: 14px; height: 14px;
+}
 .react-flow__handle.xy-handle.compatible { box-shadow: 0 0 0 4px color-mix(in srgb, var(--h) 35%, transparent); }
 .react-flow__handle.xy-handle.dimmed { opacity: 0.22; }
 .react-flow__handle.xy-handle.mount {
@@ -400,6 +418,9 @@ body {
 .loadbar .iconbtn { margin-left: auto; }
 /* Same bar, success colouring -- an export that worked should not be styled
    like an error, but it is the same shape of transient notice. */
+.target-select {
+  font-size: 11px; padding: 4px 6px; max-width: 150px;
+}
 .loadbar.ok {
   background: #1e2a22; border-bottom-color: #2f5c3f; color: var(--ok);
 }
@@ -532,3 +553,57 @@ body {
 .port-icon.hexagon { clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%); }
 .port-icon.bar { width: 18px; height: 8px; margin-top: 6px; border-radius: 2px; }
 .port-icon.bigsquare { width: 18px; height: 18px; border-radius: 2px; margin-top: -1px; }
+.port-icon.pentagon { clip-path: polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%); width: 15px; }
+.port-icon.diamond { clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%); width: 14px; }
+
+
+/* --- Design / Programming layers -----------------------------------------
+   One graph, two lenses. The inactive layer stays VISIBLE rather than hidden:
+   a condition is about a specific solid, so hiding the mechanism while wiring
+   logic would remove the thing the logic refers to. Dimming keeps the wire
+   endpoints findable while making it obvious which layer is being edited.
+   Pointer events stay on so a dimmed block can still be clicked -- switching
+   tabs to fix a typo would be a pointless interruption. */
+.layer-dim .node { opacity: 0.3; filter: saturate(0.5); }
+.layer-dim .node.sel { opacity: 0.85; filter: none; }
+.layer-dim .react-flow__handle { opacity: 0.25; }
+
+.state-tag {
+  color: var(--boolean); font-family: var(--cond); font-size: 9px;
+  white-space: nowrap; padding-right: 5px;
+}
+
+/* The mode switch sits with the palette, since it changes what the palette
+   offers as much as what the canvas emphasises. */
+.layer-switch { display: flex; gap: 0; margin-bottom: 10px; }
+.layer-switch button {
+  flex: 1; font-size: 11px; padding: 6px 8px;
+  background: var(--panel-2); color: var(--ink-2);
+  border: 1px solid var(--line); cursor: pointer;
+}
+.layer-switch button:first-child { border-radius: 4px 0 0 4px; }
+.layer-switch button:last-child { border-radius: 0 4px 4px 0; border-left: none; }
+.layer-switch button.on {
+  background: var(--panel-3); color: var(--ink); border-color: var(--line-bright);
+}
+
+/* Trigger switches in the Motion tab. */
+.trigger-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 0 0;
+}
+.trigger-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; padding: 4px 9px; border-radius: 999px;
+  border: 1px solid var(--line-bright); background: var(--panel-2);
+  color: var(--ink-2); cursor: pointer;
+}
+.trigger-chip.on {
+  background: color-mix(in srgb, var(--boolean) 22%, var(--panel-2));
+  border-color: var(--boolean); color: var(--ink);
+}
+.trigger-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ink-3);
+}
+.trigger-chip.on .trigger-dot { background: var(--boolean); }

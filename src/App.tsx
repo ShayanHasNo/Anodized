@@ -7,7 +7,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-import { Block, PortType, canConnect, portsFor, channelsFor, Edge as SimEdge } from './sim/blocks';
+import { Block, PROGRAMMING_KINDS, PortType, canConnect, portsFor, channelsFor, Edge as SimEdge } from './sim/blocks';
 import { compile, inertia, CompileError, type MechanismGroup } from './sim/compile';
 import { simulate, createRun, type Run, type SimResult } from './sim/solver';
 import { nodeTypes, TYPE_COLOR } from './canvas/nodes';
@@ -17,7 +17,7 @@ import { Library } from './Library';
 import { ActionsView, compileProgram, programDuration, type Program, type Action } from './ActionsView';
 import type { ResolvedStateGroup } from './sim/compile';
 import { serialize, deserialize, highestIdSuffix, downloadJson, filenameFor } from './persist';
-import { generateJava } from './export/java';
+import { generateJava, type CodegenTarget } from './export/java';
 import { makeZip, downloadBlob } from './export/zip';
 import { dimensionOf, conversionFactor, unitLabel } from './sim/units';
 import { MotionView, type MotionMech } from './motion/MotionView';
@@ -87,6 +87,24 @@ function makeBlock(kind: Block['kind']): Block {
         mass: 6, inertia: inertia.rodAboutEnd(6, 0.9), cgRadius: 0.45,
         friction: 0.5, initialPosition: 0,
       };
+    case 'limitSwitch':
+      return {
+        kind, id: nextId('limit'), label: 'Limit switch',
+        position: 0, direction: 'below',
+      };
+    case 'encoder':
+      return {
+        kind, id: nextId('enc'), label: 'Encoder',
+        mode: 'position', threshold: 0, direction: 'above',
+      };
+    case 'if':
+      return { kind, id: nextId('if'), label: 'AND', op: 'and' };
+    case 'waitUntil':
+      return { kind, id: nextId('wait'), label: 'Wait until' };
+    case 'while':
+      return { kind, id: nextId('while'), label: 'While' };
+    case 'trigger':
+      return { kind, id: nextId('trig'), label: 'Trigger', initial: false };
     case 'pid':
       return {
         kind, id: nextId('pid'), source: null, target: 75,
@@ -175,6 +193,15 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [errorBlockId, setErrorBlockId] = useState<string | null>(null);
   const [showLibrary, setShowLibrary] = useState(false);
+  /* Which half of the graph is being edited. One graph either way -- this only
+     changes what the palette offers and which blocks are emphasised. */
+  const [layer, setLayer] = useState<'design' | 'programming'>('design');
+  /* Live positions of the manual triggers. Kept out of the blocks so flipping
+     a switch to test something does not count as editing the design. */
+  const [triggerValues, setTriggerValues] = useState<Record<string, boolean>>({});
+  /* Mirrors triggerValues for the live-run effect to read without depending on
+     it. A dependency here would rebuild the run on every flip. */
+  const triggersRef = useRef<Record<string, boolean>>({});
   const [view, setView] = useState<'canvas' | 'graphs' | 'motion' | 'actions'>('canvas');
   const [programs, setPrograms] = useState<Program[]>([]);
   const [actions, setActions] = useState<Action[]>([]);
@@ -186,10 +213,23 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [exportNote, setExportNote] =
     useState<{ text: string; warnings: string[] } | null>(null);
+  /* Which WPILib generation to emit. Remembered across sessions because it is a
+     property of the team's robot project, not of any one design -- a team on
+     2027 wants 2027 every time they export. */
+  const [codegenTarget, setCodegenTarget] = useState<CodegenTarget>(() => {
+    try {
+      const saved = localStorage.getItem('anodized.codegenTarget');
+      if (saved === 'classic' || saved === 'cmd3') return saved;
+    } catch { /* storage unavailable -- fall through */ }
+    return 'classic';
+  });
+  useEffect(() => {
+    try { localStorage.setItem('anodized.codegenTarget', codegenTarget); } catch { /* ignore */ }
+  }, [codegenTarget]);
   const fileRef = useRef<HTMLInputElement>(null);
   const [duration, setDuration] = useState(1.5);
   const [designName, setDesignName] = useState('Untitled design');
-  const [runMode, setRunMode] = useState<'fixed' | 'live'>('fixed');
+  const [runMode, setRunMode] = useState<'fixed' | 'live' | 'transition'>('fixed');
   const [liveRunning, setLiveRunning] = useState(false);
   const liveRun = useRef<Run | null>(null);
   const liveRaf = useRef<number | null>(null);
@@ -205,6 +245,16 @@ export default function App() {
       .filter((n) => n.type !== 'plotter' && n.type !== 'group')
       .map((n) => (n.data as { block: Block }).block),
     [nodes],
+  );
+
+  /* Triggers surfaced to the Motion tab. Derived straight from the blocks
+     rather than from a successful compile: a person drops a trigger and
+     expects its switch immediately, and a design that does not compile yet is
+     exactly when being able to flip one is most useful. */
+  const compiledTriggers = useMemo(
+    () => blocks.filter((b): b is Extract<Block, { kind: 'trigger' }> => b.kind === 'trigger')
+      .map((b) => ({ blockId: b.id, label: b.label || b.id, initial: b.initial })),
+    [blocks],
   );
   const blockById = useMemo(() => new Map(blocks.map((b) => [b.id, b])), [blocks]);
   const selectedBlock = selected ? blockById.get(selected) ?? null : null;
@@ -493,7 +543,7 @@ export default function App() {
       // A program needs enough runway to actually finish; pad past its last
       // wait so the final state has time to settle.
       const runFor = prog ? Math.max(duration, programDuration(prog, actions) + 1) : duration;
-      const r = simulate(sys, { duration: runFor, schedule });
+      const r = simulate(sys, { duration: runFor, schedule, triggers: triggerValues });
       setResult(r);
       setStateGroups(sys.stateGroups);
       setFrame((f) => (f >= r.steps ? 0 : f));
@@ -514,7 +564,7 @@ export default function App() {
       setErrorBlockId(e instanceof CompileError ? e.blockId ?? null : null);
       setResult(null);
     }
-  }, [toSimEdges, blocks, duration, groups, programs, actions, activeProgram]);
+  }, [toSimEdges, blocks, duration, groups, programs, actions, activeProgram, triggerValues]);
 
   /* Live tuning: re-run automatically a beat after anything changes, rather
      than making the person click Run after every field edit. Debounced so a
@@ -530,7 +580,7 @@ export default function App() {
      solving a fixed window up front. Same solver, same stepping -- the only
      difference is that nothing decides in advance when to stop. */
   useEffect(() => {
-    if (runMode !== 'live' || !liveRunning) return;
+    if ((runMode !== 'live' && runMode !== 'transition') || !liveRunning) return;
     let cancelled = false;
     try {
       const sys = compile(blocks, toSimEdges(), groups);
@@ -542,9 +592,20 @@ export default function App() {
          refused to move, and editing a setpoint by hand DID move it, which
          makes it look like the state block is broken rather than the schedule
          never having been handed over. */
-      const prog = programs.find((p) => p.id === activeProgram) ?? null;
+      /* Transition mode deliberately runs WITHOUT the program.
+         The point of the mode is to watch what the programming graph does on
+         its own, and a running program writes the same controller targets the
+         rules do -- so leaving it in would mean watching two things fight and
+         not being able to tell which one moved the mechanism. */
+      const prog = runMode === 'transition'
+        ? null
+        : programs.find((p) => p.id === activeProgram) ?? null;
       const schedule = prog ? compileProgram(prog, sys.stateGroups, actions) : undefined;
-      const r = createRun(sys, { duration: 2, schedule });
+      /* triggersRef, not triggerValues: this effect must not re-run when a
+         switch is flipped, or the run is rebuilt from rest and the animation
+         snaps back to the start. The current values are read once here to seed
+         the run, and every later change is pushed in through setTriggers. */
+      const r = createRun(sys, { duration: 2, schedule, triggers: triggersRef.current });
       liveRun.current = r;
       setStateGroups(sys.stateGroups);
       setError(null);
@@ -589,6 +650,16 @@ export default function App() {
       if (liveRaf.current !== null) cancelAnimationFrame(liveRaf.current);
     };
   }, [runMode, liveRunning, blocks, toSimEdges, groups, programs, actions, activeProgram]);
+
+  /* Trigger changes are pushed into the RUNNING simulation rather than
+     restarting it. This is the whole difference the transition mode buys: the
+     mechanism keeps its position, its velocity, and its latch memory, so
+     flipping a switch looks like an operator pressing a button mid-match
+     instead of the match starting over. */
+  useEffect(() => {
+    triggersRef.current = triggerValues;
+    liveRun.current?.setTriggers(triggerValues);
+  }, [triggerValues]);
 
   /* Series are built per plotter, so each one gets its own independent pair of
      axes. Unit families are assigned to axes in the order they appear within
@@ -735,7 +806,20 @@ export default function App() {
      without touching the nodes React Flow treats as source of truth for drag
      and selection. */
   const nodesForCanvas = useMemo(
-    () => nodes.map((n) => {
+    () => nodes.map((raw) => {
+      /* Dim whichever layer is not being edited. Dimmed, not hidden: a
+         condition is ABOUT a solid, so hiding the mechanism while wiring logic
+         would remove the very thing the logic refers to, and the wire from a
+         sensor to its solid would dangle in empty space. */
+      const kind = raw.type === 'group' || raw.type === 'plotter'
+        ? raw.type
+        : (raw.data as { block?: Block }).block?.kind ?? raw.type;
+      const isProgramming = PROGRAMMING_KINDS.has(String(kind));
+      const dim = layer === 'programming' ? !isProgramming : isProgramming;
+      const n = dim
+        ? { ...raw, className: `${raw.className ?? ''} layer-dim`.trim() }
+        : raw;
+
       if (n.id === errorBlockId) return { ...n, data: { ...n.data, hasError: true } };
       if (n.type === 'plotter') {
         const count = plotterEdges.filter((e) => e.target === n.id).length;
@@ -751,7 +835,7 @@ export default function App() {
       }
       return n;
     }),
-    [nodes, errorBlockId, compiled, plotterEdges, groups],
+    [nodes, errorBlockId, compiled, plotterEdges, groups, layer],
   );
 
   /* --- plotters, save, load ------------------------------------------------ */
@@ -832,12 +916,15 @@ export default function App() {
   const onExportCode = () => {
     try {
       const sys = compile(blocks, toSimEdges(), groups);
-      const { entries, plans, warnings } = generateJava(sys, groups, designName);
+      const { entries, plans, warnings } =
+        generateJava(sys, groups, designName, codegenTarget);
       const base = filenameFor(designName).replace(/\.json$/, '');
-      downloadBlob(`${base}-java.zip`, makeZip(entries));
+      const suffix = codegenTarget === 'cmd3' ? '-java-2027' : '-java';
+      downloadBlob(`${base}${suffix}.zip`, makeZip(entries));
       setExportNote({
-        text: `Exported ${plans.length} subsystem${plans.length === 1 ? '' : 's'}`
-          + ` (${entries.length} files).`,
+        text: `Exported ${plans.length} ${codegenTarget === 'cmd3' ? 'mechanism' : 'subsystem'}`
+          + `${plans.length === 1 ? '' : 's'} (${entries.length} files,`
+          + ` ${codegenTarget === 'cmd3' ? 'WPILib 2027 / commands v3' : 'classic WPILib'}).`,
         warnings,
       });
       setError(null);
@@ -946,9 +1033,15 @@ export default function App() {
           }}
         />
         <button className="btn" onClick={onExportCode}
-          title="Download WPILib + AdvantageKit subsystems for these mechanisms">
+          title="Download WPILib + AdvantageKit code for these mechanisms">
           Export code
         </button>
+        <select className="target-select" value={codegenTarget}
+          onChange={(e) => setCodegenTarget(e.target.value as CodegenTarget)}
+          title="Which WPILib generation the exported code targets">
+          <option value="classic">Classic (2026)</option>
+          <option value="cmd3">2027 · commands v3</option>
+        </select>
         <button className="btn" onClick={() => setShowLibrary(true)}>Library</button>
         {programs.length > 0 && (
           <select
@@ -1001,21 +1094,68 @@ export default function App() {
 
       <div className="body">
         <aside className="rail">
-          <h2 className="railhead">Add block</h2>
-          {([
-            ['battery', 'Battery', 'electrical'],
-            ['motor', 'Motor', 'electrical'],
-            ['gear', 'Gear', 'rotational'],
-            ['solid', 'Solid', 'rotational'],
-            ['joint', 'Joint', 'mount'],
-            ['state', 'States', 'signal'],
-          ] as const).map(([kind, label, type]) => (
-            <button key={kind} className="palette-item"
-              style={{ ['--acc' as string]: TYPE_COLOR[type] }}
-              onClick={() => addBlock(kind)}>
-              {label}
-            </button>
-          ))}
+          <div className="layer-switch">
+            <button className={layer === 'design' ? 'on' : ''}
+              onClick={() => setLayer('design')}>Design</button>
+            <button className={layer === 'programming' ? 'on' : ''}
+              onClick={() => setLayer('programming')}>Programming</button>
+          </div>
+
+          {layer === 'design' ? (
+            <>
+              <h2 className="railhead">Add block</h2>
+              {([
+                ['battery', 'Battery', 'electrical'],
+                ['motor', 'Motor', 'electrical'],
+                ['gear', 'Gear', 'rotational'],
+                ['solid', 'Solid', 'rotational'],
+                ['joint', 'Joint', 'mount'],
+                ['state', 'States', 'signal'],
+              ] as const).map(([kind, label, type]) => (
+                <button key={kind} className="palette-item"
+                  style={{ ['--acc' as string]: TYPE_COLOR[type] }}
+                  onClick={() => addBlock(kind)}>
+                  {label}
+                </button>
+              ))}
+            </>
+          ) : (
+            <>
+              <h2 className="railhead">Sensors</h2>
+              <div className="hint" style={{ marginBottom: 8 }}>
+                Wire a solid's pentagon port into these. They read state the
+                simulator already tracks — no extra hardware implied.
+              </div>
+              <button className="palette-item"
+                style={{ ['--acc' as string]: TYPE_COLOR.sense }}
+                onClick={() => addBlock('limitSwitch')}>
+                Limit switch
+              </button>
+              <button className="palette-item"
+                style={{ ['--acc' as string]: TYPE_COLOR.sense }}
+                onClick={() => addBlock('encoder')}>
+                Encoder
+              </button>
+
+              <h2 className="railhead">Logic</h2>
+              <div className="hint" style={{ marginBottom: 8 }}>
+                Diamonds carry true/false. Land one on a state's port to say
+                when that state should run.
+              </div>
+              {([
+                ['if', 'If (and/or/not)'],
+                ['waitUntil', 'Wait until'],
+                ['while', 'While'],
+                ['trigger', 'Trigger'],
+              ] as const).map(([kind, label]) => (
+                <button key={kind} className="palette-item"
+                  style={{ ['--acc' as string]: TYPE_COLOR.boolean }}
+                  onClick={() => addBlock(kind)}>
+                  {label}
+                </button>
+              ))}
+            </>
+          )}
 
           <h2 className="railhead">Layout</h2>
           <button className="palette-item"
@@ -1059,15 +1199,21 @@ export default function App() {
             <select value={runMode}
               onChange={(e) => {
                 setLiveRunning(false);
-                setRunMode(e.target.value as 'fixed' | 'live');
+                setRunMode(e.target.value as 'fixed' | 'live' | 'transition');
               }}>
               <option value="fixed">Fixed duration</option>
               <option value="live">Real time</option>
+              <option value="transition">Transition test</option>
             </select>
             <div className="hint">
               {runMode === 'fixed'
                 ? 'Solves the whole window instantly, then re-solves as you edit.'
-                : 'Advances against the wall clock with no end. Edits restart the run.'}
+                : runMode === 'live'
+                  ? 'Advances against the wall clock with no end. Edits restart the run.'
+                  : 'For exercising the programming graph. Runs continuously with no '
+                    + 'program attached, and flipping a trigger takes effect on the next '
+                    + 'step instead of restarting — the mechanism keeps its position, '
+                    + 'speed, and latches.'}
             </div>
           </div>
           <div className="field" style={{ display: runMode === 'fixed' ? undefined : 'none' }}>
@@ -1113,7 +1259,12 @@ export default function App() {
             onChangeActions={setActions} onSelect={setActiveProgram} />
         ) : view === 'motion' ? (
           <div className="graphs-wrap">
-            <MotionView mechs={motionMechs} time={result?.time ?? new Float64Array()}
+            <MotionView
+              live={runMode !== 'fixed' && liveRunning}
+              triggers={compiledTriggers}
+              triggerValues={triggerValues}
+              onTrigger={(id, v) => setTriggerValues((prev) => ({ ...prev, [id]: v }))}
+              mechs={motionMechs} time={result?.time ?? new Float64Array()}
               index={frame} onIndex={setFrame} />
           </div>
         ) : (

@@ -25,7 +25,23 @@
  * not part of the warm/cool palette the physical types use. Gray reads as
  * "structure," the same way it does on the mechanism box border.
  */
-export type PortType = 'rotational' | 'linear' | 'electrical' | 'signal' | 'control' | 'mount';
+/*
+ * Two more types for the programming layer, and the same mnemonic rule:
+ *
+ *   pentagon -> sense   ("this watches a solid")
+ *   diamond  -> boolean ("this carries a true/false")
+ *
+ * The split is deliberate. A sensor has BOTH: a pentagon into the solid it
+ * observes, and a diamond out toward the logic that uses it. Shape therefore
+ * always answers "what does this connect to" rather than "which block owns
+ * it" -- a diamond means boolean whether it sits on a sensor, an if block, or
+ * a manual trigger, so a wire's legality is readable without knowing either
+ * end's block type. Diamond is the traditional flowchart decision shape, which
+ * is free prior knowledge for anyone who has seen one.
+ */
+export type PortType =
+  | 'rotational' | 'linear' | 'electrical' | 'signal' | 'control' | 'mount'
+  | 'sense' | 'boolean';
 
 export const PORT_SHAPE: Record<PortType, string> = {
   rotational: 'circle',
@@ -34,6 +50,8 @@ export const PORT_SHAPE: Record<PortType, string> = {
   signal: 'hexagon',
   control: 'bar',
   mount: 'bigsquare',
+  sense: 'pentagon',
+  boolean: 'diamond',
 };
 
 export const PORT_UNITS: Record<PortType, string> = {
@@ -43,6 +61,8 @@ export const PORT_UNITS: Record<PortType, string> = {
   electrical: 'V, A',
   signal: 'varies by channel',
   control: 'duty cycle, -1..1',
+  sense: 'observes a solid',
+  boolean: 'true / false',
 };
 
 export interface Port {
@@ -288,9 +308,121 @@ export interface JointBlock {
   jointType: JointType;
 }
 
+/* --- the programming layer ------------------------------------------------
+ *
+ * These blocks answer a question the mechanism layer cannot: WHEN should a
+ * mechanism change what it is doing. They live on the same canvas and the same
+ * graph as the mechanism blocks -- the Design/Programming switch only changes
+ * which half is emphasised -- because a condition is about a specific solid,
+ * and splitting them into two documents would mean keeping two graphs in sync
+ * and re-deriving the link between them on every edit.
+ *
+ * They carry no physics. Nothing here changes a torque or draws a current;
+ * they read state that the solver already computes and decide what the
+ * mechanism should be asked for next.
+ */
+
+/**
+ * Fires when a solid passes a position threshold.
+ *
+ * Restricted to arms and elevators on purpose: a limit switch is a physical
+ * object bolted at a place the mechanism travels past, and a flywheel has no
+ * position to bolt it at -- its "position" is an ever-growing revolution count
+ * that no switch could be placed against. The compiler rejects the wire rather
+ * than accepting it and quietly never firing.
+ */
+export interface LimitSwitchBlock {
+  kind: 'limitSwitch';
+  id: string;
+  label: string;
+  /** Threshold in the watched solid's display units. */
+  position: number;
+  /** Which side of the threshold reads true. */
+  direction: 'above' | 'below';
+}
+
+/**
+ * Fires when a solid's position or velocity passes a threshold.
+ *
+ * This is a CONDITION, not a piece of hardware. It reads the same state the
+ * solver already tracks for that solid, so it implies no second encoder on the
+ * robot and generates no extra hardware object in the exported code -- it
+ * becomes a comparison against the inputs the mechanism already reports.
+ */
+export interface EncoderBlock {
+  kind: 'encoder';
+  id: string;
+  label: string;
+  mode: 'position' | 'velocity';
+  threshold: number;
+  direction: 'above' | 'below';
+}
+
+/** Boolean combinator. Two inputs for and/or, one for not. */
+export interface IfBlock {
+  kind: 'if';
+  id: string;
+  label: string;
+  op: 'and' | 'or' | 'not';
+}
+
+/**
+ * Latches true once its input has been true.
+ *
+ * Distinct from a bare condition because it does not go false again when the
+ * input does: "the elevator reached the top at some point" is a different
+ * claim from "the elevator is at the top right now", and sequencing needs the
+ * first one.
+ */
+export interface WaitUntilBlock {
+  kind: 'waitUntil';
+  id: string;
+  label: string;
+}
+
+/**
+ * Holds its target state for as long as the condition is true.
+ *
+ * The distinction from a plain transition is what happens when the condition
+ * goes false: a transition has already fired and does not undo itself, while a
+ * while block releases, letting a lower-priority rule or the resting state
+ * take over again.
+ */
+export interface WhileBlock {
+  kind: 'while';
+  id: string;
+  label: string;
+}
+
+/**
+ * A boolean a person flips by hand from the Motion tab.
+ *
+ * Stands in for everything the simulator cannot model -- an operator button, a
+ * beam break with a game piece in it, a vision target coming into view -- so a
+ * programming graph can be exercised before any of that exists. In exported
+ * code it becomes a settable field with the same shape as a real sensor, so
+ * swapping it for hardware later is a one-line change.
+ */
+export interface TriggerBlock {
+  kind: 'trigger';
+  id: string;
+  label: string;
+  /** Value the trigger holds when a run starts. */
+  initial: boolean;
+}
+
+export type SensorBlock = LimitSwitchBlock | EncoderBlock;
+export type LogicBlock = IfBlock | WaitUntilBlock | WhileBlock | TriggerBlock;
+
+/** Blocks belonging to the programming layer rather than the mechanism. */
+export const PROGRAMMING_KINDS: ReadonlySet<string> =
+  new Set(['limitSwitch', 'encoder', 'if', 'waitUntil', 'while', 'trigger']);
+
+export const SENSOR_KINDS: ReadonlySet<string> = new Set(['limitSwitch', 'encoder']);
+
 export type Block =
   | BatteryBlock | MotorBlock | GearBlock | SolidBlock | ControllerBlock
-  | JointBlock | StateBlock;
+  | JointBlock | StateBlock | SensorBlock | LogicBlock;
 
 // --- Signal channels --------------------------------------------------------
 
@@ -372,6 +504,16 @@ export function channelsFor(block: Block): Channel[] {
     case 'joint':
     case 'state':
       return [];
+    /* Programming blocks expose their boolean as a plottable channel: seeing
+       WHEN a condition went true, lined up against the position trace that
+       caused it, is most of debugging a state machine. */
+    case 'limitSwitch':
+    case 'encoder':
+    case 'if':
+    case 'waitUntil':
+    case 'while':
+    case 'trigger':
+      return [{ key: p('value'), label: block.label || 'Value', unit: '0/1', family: 'duty' }];
   }
 }
 
@@ -400,6 +542,10 @@ export function canConnect(
       reason: `A ${PORT_SHAPE[out.type]} port cannot drive a ${PORT_SHAPE[inp.type]} port.`,
     };
   }
+  /* Sense and boolean wires carry no power, so fan-out is free and meaningful:
+     several sensors can watch one solid, and one condition can feed several
+     rules. Only the input side stays single, since a logic block reading two
+     booleans on one port would have no defined combination. */
   if (out.type !== 'signal' && inputOccupied) {
     return { ok: false, reason: 'That input is already connected.' };
   }
@@ -409,6 +555,12 @@ export function canConnect(
 /** Ports a block exposes, in canvas order. */
 export function portsFor(block: Block): Port[] {
   const sig: Port = { id: 'signal', type: 'signal', direction: 'out' };
+  /* Sensors take a pentagon from the solid they watch and hand out a diamond.
+     Logic blocks are diamond-in, diamond-out. A trigger has no input at all --
+     it is a source, which is exactly what makes it a stand-in for hardware
+     that does not exist yet. */
+  const senseIn: Port = { id: 'solid', type: 'sense', direction: 'in' };
+  const boolOut: Port = { id: 'value', type: 'boolean', direction: 'out' };
   switch (block.kind) {
     case 'battery':
       return [{ id: 'out', type: 'electrical', direction: 'out' }, sig];
@@ -436,6 +588,11 @@ export function portsFor(block: Block): Port[] {
         // a joint's own type is what carries the compatibility constraint.
         { id: 'mount', type: 'mount', direction: 'in' },
         { id: 'tip', type: 'mount', direction: 'out' },
+        // Pentagon out: what sensors attach to. On the solid rather than on
+        // the mechanism box because a condition is about one body's position
+        // -- "the carriage is at the top" names a specific stage, and a box
+        // holding a four-stage cascade has four different answers.
+        { id: 'sense', type: 'sense', direction: 'out' },
         sig,
       ];
     case 'joint':
@@ -447,7 +604,36 @@ export function portsFor(block: Block): Port[] {
       // One signal input: wire a MECHANISM BOX into it. The state block then
       // discovers every controller in that box, plus every controller on
       // anything jointed below it.
-      return [{ id: 'mechanism', type: 'signal', direction: 'in' }];
+      /* One hex for the mechanism, plus one diamond per state. Per-state
+         ports rather than a single input with a dropdown: the whole point of
+         the programming layer is that you can SEE what drives what, and a
+         wire landing on "L4" says that without opening an inspector. The port
+         id carries the state name so a renamed state drops its wires rather
+         than silently rerouting them to a different state. */
+      return [
+        { id: 'mechanism', type: 'signal', direction: 'in' },
+        ...block.states.map((st): Port => ({
+          id: `when:${st.name}`, type: 'boolean', direction: 'in',
+        })),
+      ];
+    case 'limitSwitch':
+    case 'encoder':
+      return [senseIn, boolOut, sig];
+    case 'if':
+      // 'not' takes one input; and/or take two. Rendering only the ports that
+      // apply keeps an unwired second input from looking like a mistake.
+      return block.op === 'not'
+        ? [{ id: 'a', type: 'boolean', direction: 'in' }, boolOut, sig]
+        : [
+            { id: 'a', type: 'boolean', direction: 'in' },
+            { id: 'b', type: 'boolean', direction: 'in' },
+            boolOut, sig,
+          ];
+    case 'waitUntil':
+    case 'while':
+      return [{ id: 'a', type: 'boolean', direction: 'in' }, boolOut, sig];
+    case 'trigger':
+      return [boolOut, sig];
     case 'pid':
     case 'bangbang':
       return [

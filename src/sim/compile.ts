@@ -12,7 +12,8 @@
 import {
   Block, BatteryBlock, MotorBlock, GearBlock, SolidBlock,
   ControllerBlock, LqrBlock, JointBlock, StateBlock, MechanismState,
-  CONTROL_KINDS, Edge,
+  CONTROL_KINDS, Edge, SensorBlock, LogicBlock,
+  PROGRAMMING_KINDS, SENSOR_KINDS,
 } from './blocks';
 import { MotorConstants, getMotor } from './motors';
 import { scaleFromBase } from './units';
@@ -128,6 +129,63 @@ export interface System {
   mechanisms: Mechanism[];
   /** State blocks, resolved against the controllers they can actually reach. */
   stateGroups: ResolvedStateGroup[];
+  /** The programming layer: conditions and the transitions they drive. */
+  program: ProgramGraph;
+}
+
+/* --- the programming layer ------------------------------------------------
+ *
+ * Conditions compile to a TREE rather than a flat list because the graph the
+ * person wires is a tree: an `if` block reading two sensors is one node with
+ * two children. Flattening it to "a list of conditions, all ANDed" would throw
+ * away the or/not the person drew, and there would be no way to recover it for
+ * either the solver or the code generator.
+ */
+
+export type ConditionNode =
+  | {
+      kind: 'sensor';
+      blockId: string;
+      label: string;
+      /** Solid whose state is compared. */
+      solidId: string;
+      /** Which channel of that solid: position or velocity. */
+      signal: 'position' | 'velocity';
+      threshold: number;
+      direction: 'above' | 'below';
+      /** Display unit of the threshold, for labels and generated comments. */
+      unit: string;
+      /** True for a limit switch, which is a physical object in exported code. */
+      physical: boolean;
+    }
+  | { kind: 'trigger'; blockId: string; label: string; initial: boolean }
+  | { kind: 'and' | 'or'; blockId: string; label: string; a: ConditionNode; b: ConditionNode }
+  | { kind: 'not'; blockId: string; label: string; a: ConditionNode }
+  | { kind: 'latch'; blockId: string; label: string; a: ConditionNode };
+
+/**
+ * One rule: while/when this condition holds, put this state group in this state.
+ *
+ * `hold` is what separates a `while` block from a plain transition. A
+ * transition fires once and the state stays; a hold is continuously true, so
+ * when the condition goes false the rule stops applying and a lower-priority
+ * rule (or the resting state) takes over again.
+ */
+export interface TransitionRule {
+  /** The logic block that terminates this chain, for error reporting. */
+  blockId: string;
+  condition: ConditionNode;
+  groupId: string;
+  stateName: string;
+  hold: boolean;
+}
+
+export interface ProgramGraph {
+  rules: TransitionRule[];
+  /** Every trigger in the graph, so the UI can offer switches for them. */
+  triggers: { blockId: string; label: string; initial: boolean }[];
+  /** Every condition node, flattened, so each can be logged as a channel. */
+  conditions: ConditionNode[];
 }
 
 /** A state block plus the controllers it commands. */
@@ -812,8 +870,269 @@ export function compile(
     return { blockId: sb.id, label: sb.label || sb.id, controllerIds, controllerLabels, states: sb.states };
   });
 
-  return { battery, mechanisms, stateGroups };
+  const program = resolveProgram(blocks, edges, mechanisms, stateGroups);
+
+  return { battery, mechanisms, stateGroups, program };
 }
+
+/* --- resolving the programming graph -------------------------------------- */
+
+/**
+ * Walks the wired logic back from each state target to build condition trees.
+ *
+ * Direction matters: this resolves BACKWARD from the thing being commanded,
+ * not forward from the sensors. A sensor wired to nothing is not an error --
+ * it is a condition someone is still building, or one they plot without acting
+ * on -- so starting from sensors would mean guessing which dangling chains
+ * were meant to do something. Starting from the state target means every rule
+ * found is one the person finished wiring.
+ */
+function resolveProgram(
+  blocks: Block[], edges: Edge[], mechanisms: Mechanism[],
+  stateGroups: ResolvedStateGroup[],
+): ProgramGraph {
+  const byId = new Map<string, Block>(blocks.map((b) => [b.id, b]));
+  void mechanisms;
+
+  /** Edge into a given block input, if any. */
+  const incoming = (blockId: string, portId: string) =>
+    edges.find((e) => e.to.blockId === blockId && e.to.portId === portId);
+
+  const conditions: ConditionNode[] = [];
+  const triggers: ProgramGraph['triggers'] = [];
+
+  /* Cycle guard. A person can wire an if block's output back into its own
+     input through a chain; without this the resolver would recurse until the
+     stack died, with no indication of which block caused it. */
+  const building = new Set<string>();
+
+  function buildCondition(blockId: string): ConditionNode {
+    const block = byId.get(blockId);
+    if (!block) throw new CompileError(`A wire points at a block that no longer exists.`, blockId);
+
+    if (building.has(blockId)) {
+      throw new CompileError(
+        `"${labelOf(block)}" is wired in a loop — a condition cannot depend on itself.`,
+        blockId,
+      );
+    }
+    building.add(blockId);
+    try {
+      const node = buildInner(block);
+      conditions.push(node);
+      return node;
+    } finally {
+      building.delete(blockId);
+    }
+  }
+
+  function labelOf(b: Block): string {
+    return 'label' in b && b.label ? b.label : b.id;
+  }
+
+  /** The solid a sensor watches, via its pentagon port. */
+  function watchedSolid(sensor: SensorBlock): SolidBlock {
+    const wire = incoming(sensor.id, 'solid');
+    if (!wire) {
+      throw new CompileError(
+        `"${labelOf(sensor)}" is not watching anything — wire a solid's pentagon port into it.`,
+        sensor.id,
+      );
+    }
+    const solid = byId.get(wire.from.blockId);
+    if (!solid || solid.kind !== 'solid') {
+      throw new CompileError(
+        `"${labelOf(sensor)}" must watch a solid.`, sensor.id,
+      );
+    }
+    return solid;
+  }
+
+  function buildInner(block: Block): ConditionNode {
+    switch (block.kind) {
+      case 'limitSwitch': {
+        const solid = watchedSolid(block);
+        /* A limit switch is a physical object bolted where the mechanism
+           travels past. A flywheel's position is an ever-growing revolution
+           count with nowhere to bolt one, so this is rejected at compile time
+           rather than accepted and silently never firing. */
+        if (solid.gravityMode === 'none') {
+          throw new CompileError(
+            `"${labelOf(block)}" is on a spinning solid. A limit switch needs a travel `
+            + `limit to sit at, so it only works on arms and elevators.`,
+            block.id,
+          );
+        }
+        return {
+          kind: 'sensor', blockId: block.id, label: labelOf(block),
+          solidId: solid.id, signal: 'position',
+          threshold: block.position, direction: block.direction,
+          unit: solid.positionUnit ?? (solid.gravityMode === 'constant' ? 'm' : 'deg'),
+          physical: true,
+        };
+      }
+      case 'encoder': {
+        const solid = watchedSolid(block);
+        const linear = solid.gravityMode === 'constant';
+        return {
+          kind: 'sensor', blockId: block.id, label: labelOf(block),
+          solidId: solid.id, signal: block.mode,
+          threshold: block.threshold, direction: block.direction,
+          unit: block.mode === 'velocity'
+            ? (solid.velocityUnit ?? (linear ? 'm/s' : 'deg/s'))
+            : (solid.positionUnit ?? (linear ? 'm' : 'deg')),
+          physical: false,
+        };
+      }
+      case 'trigger':
+        triggers.push({ blockId: block.id, label: labelOf(block), initial: block.initial });
+        return {
+          kind: 'trigger', blockId: block.id,
+          label: labelOf(block), initial: block.initial,
+        };
+      case 'if': {
+        const a = incoming(block.id, 'a');
+        if (!a) {
+          throw new CompileError(
+            `"${labelOf(block)}" has no input wired into A.`, block.id,
+          );
+        }
+        if (block.op === 'not') {
+          return {
+            kind: 'not', blockId: block.id, label: labelOf(block),
+            a: buildCondition(a.from.blockId),
+          };
+        }
+        const b = incoming(block.id, 'b');
+        if (!b) {
+          throw new CompileError(
+            `"${labelOf(block)}" is an ${block.op.toUpperCase()} and needs both inputs wired.`,
+            block.id,
+          );
+        }
+        return {
+          kind: block.op, blockId: block.id, label: labelOf(block),
+          a: buildCondition(a.from.blockId), b: buildCondition(b.from.blockId),
+        };
+      }
+      case 'waitUntil': {
+        const a = incoming(block.id, 'a');
+        if (!a) {
+          throw new CompileError(
+            `"${labelOf(block)}" has nothing to wait for — wire a condition into it.`,
+            block.id,
+          );
+        }
+        return {
+          kind: 'latch', blockId: block.id, label: labelOf(block),
+          a: buildCondition(a.from.blockId),
+        };
+      }
+      case 'while': {
+        const a = incoming(block.id, 'a');
+        if (!a) {
+          throw new CompileError(
+            `"${labelOf(block)}" has no condition wired into it.`, block.id,
+          );
+        }
+        return buildCondition(a.from.blockId);
+      }
+      default:
+        throw new CompileError(
+          `"${labelOf(block)}" is not a condition — only sensors, triggers, and logic `
+          + `blocks can drive a state.`,
+          block.id,
+        );
+    }
+  }
+
+  /* A rule exists where a boolean wire lands on a state block's mechanism
+     port. The state block carries which state to select. */
+  const rules: TransitionRule[] = [];
+  for (const edge of edges) {
+    const target = byId.get(edge.to.blockId);
+    if (!target || target.kind !== 'state') continue;
+    if (!edge.to.portId.startsWith('when:')) continue;
+
+    const stateName = edge.to.portId.slice('when:'.length);
+    const group = stateGroups.find((g) => g.blockId === target.id);
+    if (!group) continue;
+    if (!group.states.some((st) => st.name === stateName)) continue;
+
+    const source = byId.get(edge.from.blockId);
+    if (!source) continue;
+
+    rules.push({
+      blockId: source.id,
+      condition: buildCondition(source.id),
+      groupId: target.id,
+      stateName,
+      hold: source.kind === 'while',
+    });
+  }
+
+  /* Triggers are collected while walking, so an unwired trigger would be
+     invisible to the Motion tab. Sweep for the rest -- a person drops a
+     trigger and expects its switch to appear before it is wired to anything. */
+  for (const b of blocks) {
+    if (b.kind === 'trigger' && !triggers.some((t) => t.blockId === b.id)) {
+      triggers.push({ blockId: b.id, label: labelOf(b), initial: b.initial });
+    }
+  }
+
+  /* Sweep for conditions that do not drive anything yet.
+     Resolving backward from state targets finds every rule, but it misses a
+     sensor someone wired up purely to PLOT -- watching when a condition would
+     have fired is how you decide where to set its threshold before committing
+     to it. Those still need evaluating and logging, so they are collected
+     here. A chain that is still half-wired throws, and that is not an error
+     at this point: it is a condition mid-construction, so it is skipped
+     rather than failing the whole compile. */
+  /* Anything already visited while resolving a rule -- not just the rule's
+     direct root -- is skipped here. A trigger feeding an `if` that feeds a
+     rule is already accounted for; re-walking it would double its channel and
+     double its entry in the trigger list, even though the final dedup above
+     would paper over the list, the wasted work and the confusing intermediate
+     state are worth avoiding at the source. */
+  /* Two different reasons a block can already be accounted for: it produced a
+     ConditionNode during rule resolution (most blocks), or it IS a rule's own
+     source but produced no node of its own -- `while` passes straight through
+     to its input's node and creates none for itself, so its id would
+     otherwise never appear in `conditions` and this sweep would walk it all
+     over again. */
+  const alreadyWalked = new Set([
+    ...conditions.map((c) => c.blockId),
+    ...rules.map((r) => r.blockId),
+  ]);
+  for (const b of blocks) {
+    if (!PROGRAMMING_KINDS.has(b.kind) || alreadyWalked.has(b.id)) continue;
+    try {
+      buildCondition(b.id);
+    } catch {
+      // Half-wired; it will resolve once the person finishes it.
+    }
+  }
+
+  /* One entry per block id, for BOTH lists. A leaf condition -- a trigger, a
+     sensor -- is reached fresh every time a DIFFERENT rule's chain passes
+     through it, since each rule calls buildCondition on its own source
+     independently. Two rules sharing one trigger (an "and" rule and its
+     complementary "not" rule, say) is an entirely ordinary graph, not an edge
+     case, so this cannot be a "shouldn't happen" cleanup step. */
+  const seenNodes = new Set<string>();
+  const unique = conditions.filter(
+    (c) => (seenNodes.has(c.blockId) ? false : (seenNodes.add(c.blockId), true)),
+  );
+  const seenTriggers = new Set<string>();
+  const uniqueTriggers = triggers.filter(
+    (t) => (seenTriggers.has(t.blockId) ? false : (seenTriggers.add(t.blockId), true)),
+  );
+
+  return { rules, triggers: uniqueTriggers, conditions: unique };
+
+}
+
+
 
 /** Convenience constructors so common inertias do not have to be looked up. */
 export const inertia = {

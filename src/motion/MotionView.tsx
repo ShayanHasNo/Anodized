@@ -50,12 +50,18 @@ const clampWidth = (w: number) =>
   Math.min(MAX_CARD_WIDTH, Math.max(MIN_CARD_WIDTH, w));
 
 export function MotionView({
-  mechs, time, index, onIndex,
+  mechs, time, index, onIndex, triggers, triggerValues, onTrigger, live,
 }: {
   mechs: MotionMech[];
   time: Float64Array;
   index: number;
   onIndex: Dispatch<SetStateAction<number>>;
+  /** Manual triggers found in the programming graph. */
+  triggers: { blockId: string; label: string; initial: boolean }[];
+  triggerValues: Record<string, boolean>;
+  onTrigger: (blockId: string, value: boolean) => void;
+  /** True while a continuous run is driving the frame. */
+  live?: boolean;
 }) {
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
@@ -239,6 +245,10 @@ export function MotionView({
           type="range" min={0} max={Math.max(0, steps - 1)} value={i}
           onChange={(e) => { setPlaying(false); onIndex(parseInt(e.target.value, 10)); }}
           style={{ flex: 1, minWidth: 120 }}
+          /* Disabled during a continuous run: the loop pins the frame to the
+             newest step every tick, so a scrub would be overwritten before it
+             rendered and the handle would fight the person's cursor. */
+          disabled={live}
           aria-label="Scrub through the simulation"
         />
         <span className="stat num" style={{ minWidth: 74, textAlign: 'right' }}>
@@ -264,6 +274,27 @@ export function MotionView({
             title="Back to the default size">Reset</button>
         </div>
       </div>
+
+      {triggers.length > 0 && (
+        <div className="trigger-row">
+          <span className="stat" style={{ color: 'var(--ink-3)' }}>
+            Triggers{live ? ' · live' : ''}
+          </span>
+          {triggers.map((tr) => {
+            const on = triggerValues[tr.blockId] ?? tr.initial;
+            return (
+              <button key={tr.blockId} className={`trigger-chip${on ? ' on' : ''}`}
+                onClick={() => onTrigger(tr.blockId, !on)}
+                title={live
+                  ? `${tr.blockId} — takes effect on the next step; the run keeps going`
+                  : `${tr.blockId} — flipping this re-solves from the start`}>
+                <span className="trigger-dot" />
+                {tr.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       <div className="motion-grid" style={{ ['--motion-card-w' as string]: `${cardWidth}px` }}>
         {roots.map((m) => {
